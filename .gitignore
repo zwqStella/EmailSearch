@@ -216,3 +216,26 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local app data
+.emailsearch/
+*.db
+*.db-shm
+*.db-wal
+
+# Bundled frontend output served by FastAPI in prod
+src/emailsearch/web/static/
+
+# Frontend build output
+frontend/dist/
+frontend/node_modules/
+frontend/*.tsbuildinfo
+
+# Tokens, secrets
+token_cache.json
+
+# Editor
+.idea/
+.vs/
+.vscode/
+
