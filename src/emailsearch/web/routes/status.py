@@ -18,9 +18,8 @@ router = APIRouter(prefix="/api", tags=["status"])
 
 
 # Custom URL scheme stored in ``EmailRow.web_link`` for COM-loaded
-# messages. The scheme is NOT registered with Windows (browsers report
-# "scheme does not have a registered handler"), so we strip the prefix
-# and drive Outlook directly via COM through :func:`open_email_in_outlook`.
+# messages. Not registered with Windows, so we strip the prefix and
+# drive Outlook via COM through :func:`open_email_in_outlook`.
 _COM_LINK_PREFIX = "outlook:"
 
 
@@ -102,14 +101,8 @@ def open_email_in_outlook(email_id: str) -> OpenEmailResponse:
 
     Resolves the email's stored EntryID (kept in ``EmailRow.web_link``
     under the ``outlook:<EntryID>`` prefix by the COM loader) and asks
-    Outlook to display it. Replaces the broken ``outlook:<EntryID>`` URL
-    scheme used in the previous version — that scheme is NOT registered
-    with Windows and fails browser-side with "scheme does not have a
-    registered handler".
-
-    The 404 path covers both "no such email" and "indexed via a non-COM
-    backend (no EntryID)" — neither is recoverable from the UI, so the
-    frontend just surfaces the detail string verbatim.
+    Outlook to display it. The 404 path covers "no such email" and
+    "indexed via a non-COM backend (no EntryID)".
     """
     with connect(get_settings().resolved_db_path) as conn:
         email = get_email(conn, email_id)

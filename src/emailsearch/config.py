@@ -35,21 +35,14 @@ class Settings(BaseSettings):
     max_attachment_mb: int = 25
 
     # --- LLM summarization + query helpers ---
-    # Best-effort: every call gracefully no-ops to None on any failure, so
-    # search still works without a server. Set llm_enabled=False to skip the
-    # network round-trips entirely.
+    # Best-effort: every call gracefully no-ops to None on any failure,
+    # so search still works without a server. Set llm_enabled=False to
+    # skip the network round-trips entirely.
     #
-    # LLM uses:
-    #   - ingest: `summarize_email` produces a per-email summary stored on
-    #     the row, indexed in FTS, and embedded as `source_type='summary'`
-    #     chunks so semantic search can match them via KNN.
-    #   - search: `distill_query` strips filler before FTS; `augment_query`
-    #     expands the query before embedding for the KNN leg.
-    #
-    # Defaults target the `copilot-api` proxy (OpenAI-compatible on :4141).
-    # `llm_model` must be a name the endpoint actually serves — strict
-    # backends (copilot-api, Azure OpenAI) reject unknown model names with
-    # HTTP 400; LM Studio / Ollama / llama.cpp usually ignore it.
+    # Defaults target the `copilot-api` proxy (OpenAI-compatible on
+    # :4141). `llm_model` must be a name the endpoint serves — strict
+    # backends (copilot-api, Azure OpenAI) reject unknown model names
+    # with HTTP 400; LM Studio / Ollama / llama.cpp usually ignore it.
     llm_enabled: bool = True
     llm_base_url: str = "http://127.0.0.1:4141/v1"
     llm_model: str = "gpt-4o-mini"
@@ -61,13 +54,39 @@ class Settings(BaseSettings):
     llm_max_input_chars: int = 8000       # truncate body before summarizing
 
     # --- Semantic ranking ---
-    # Per-chunk score floor for the embedding (KNN) leg. vec0 distances are
-    # converted via ``1 / (1 + distance)`` (range [0, 1]); chunks scoring
-    # below this are dropped before per-email grouping. Only the embedding
-    # leg is gated — verbatim FTS matches remain a strong signal even when
-    # the embedding similarity is incidental. Tune down for more recall, up
-    # for higher confidence.
+    # Per-chunk score floor for the embedding (KNN) leg. vec0 distances
+    # are converted via ``1 / (1 + distance)`` (range [0, 1]); chunks
+    # below this are dropped before per-email grouping. Only the
+    # embedding leg is gated — FTS verbatim matches remain a strong
+    # signal even when embedding similarity is incidental.
     semantic_score_threshold: float = 0.3
+
+    # --- Ask (RAG) tab ---
+    # Retrieval breadth for the agent's single search tool-call. Tune up
+    # for "summarize my recent emails about X" style questions that need
+    # broader context.
+    ask_retrieval_limit: int = 8
+    # Max output tokens for the streaming synthesis call. The answer
+    # plus its inline ``[N]`` citations has to fit in this budget.
+    ask_max_answer_tokens: int = 600
+    # Token budget for the synthesis prompt's sources block (all
+    # selected emails combined). CJK-aware estimator + max-min
+    # fair-share allocation: short emails get their full content, long
+    # ones share what's left. 8000 tokens leaves comfortable headroom
+    # under a 12K-token model (the strictest tier on common proxies).
+    ask_max_prompt_tokens: int = 8000
+    # Max emails to read FULLY after triage. Keeping this small (3) is
+    # what gets the synthesis prompt from ~24K tokens down to ~5-10K.
+    # Triage is SKIPPED when ``len(hits) <= ask_triage_limit`` or when
+    # the LLM is disabled — both cases fall through to "read all" with
+    # the same fair-share allocator.
+    ask_triage_limit: int = 3
+    # Token cap for the triage hop. Output is a single short line of
+    # comma-separated indexes or "NONE", so keep the budget tight.
+    ask_triage_max_tokens: int = 60
+    # Token cap for the question-parser hop (combined distill + filter
+    # extraction). Output is a single short JSON object.
+    ask_parse_max_tokens: int = 200
 
     # --- Diagnostics ---
     # When True, every /api/search response includes a `debug` field with

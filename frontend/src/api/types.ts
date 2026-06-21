@@ -86,6 +86,95 @@ export type SearchStreamEvent =
   | SearchStreamError
   | SearchStreamDone;
 
+// ---------- ask (RAG agent) streaming events ----------
+
+/** Mode hint for the agent's single search tool call. Mirrors
+ *  `SearchMode` but kept as a separate name for readability — the Ask
+ *  tab may eventually expose its own retrieval-mode UI. */
+export type AskMode = SearchMode;
+
+/** Filters extracted from the natural-language question by the parser.
+ *  All fields are independently nullable. Sent on the `parsed` event so
+ *  the UI can render the inferred filters as pills (e.g. "Past 30 days"
+ *  / "alice@example.com"). */
+export interface AskParsedFilters {
+  start_at: number | null;
+  end_at: number | null;
+  from_address: string | null;
+}
+
+/** First event from /api/ask/stream — echoes back what the server is
+ *  about to run. */
+export interface AskStreamMeta {
+  type: 'meta';
+  question: string;
+  mode: AskMode;
+  limit: number | null;
+}
+
+/** Second event — the question parser's output. Carries the distilled
+ *  topical query and the hard filters inferred from the question. */
+export interface AskStreamParsed {
+  type: 'parsed';
+  query: string;
+  filters: AskParsedFilters;
+}
+
+/** Third event — full list of retrieved sources. Sent BEFORE the
+ *  answer starts streaming so inline `[N]` citation buttons in the
+ *  answer can resolve their target email immediately. */
+export interface AskStreamSources {
+  type: 'sources';
+  hits: SearchHit[];
+}
+
+/** Fourth event — which of the retrieved sources the LLM-guided
+ *  triage hop chose to read in FULL for the synthesis prompt.
+ *
+ *  ``selected_indexes`` are 1-based offsets into the `hits` array
+ *  from the prior `sources` event. ``triaged`` is true when the
+ *  triage hop actually ran (``len(hits) > ask_triage_limit`` AND the
+ *  LLM was reachable). When false, every retrieved source was read
+ *  and ``selected_indexes`` mirrors the full list — the UI uses this
+ *  to decide whether to render a "Read 3 of 8 emails" badge or
+ *  nothing. */
+export interface AskStreamTriage {
+  type: 'triage';
+  selected_indexes: number[];
+  triaged: boolean;
+}
+
+/** Zero-or-more events — one per LLM-emitted fragment of the answer.
+ *  Concatenating every `text` in order reconstructs the full answer. */
+export interface AskStreamAnswerDelta {
+  type: 'answer_delta';
+  text: string;
+}
+
+/** Final event — signals "answer streaming complete, render the
+ *  References footnote now". Carries the wall-clock for telemetry. */
+export interface AskStreamDone {
+  type: 'done';
+  duration_ms: number;
+}
+
+/** Replaces the rest of the stream when any step fails (parse / search
+ *  / synthesis). The agent never raises — it always emits this and
+ *  closes the stream cleanly. */
+export interface AskStreamError {
+  type: 'error';
+  message: string;
+}
+
+export type AskStreamEvent =
+  | AskStreamMeta
+  | AskStreamParsed
+  | AskStreamSources
+  | AskStreamTriage
+  | AskStreamAnswerDelta
+  | AskStreamDone
+  | AskStreamError;
+
 export interface AttachmentRecord {
   att_id: string;
   name: string;

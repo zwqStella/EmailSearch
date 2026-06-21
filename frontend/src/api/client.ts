@@ -1,6 +1,8 @@
 // Typed fetch wrappers. Keep this thin — TanStack Query handles caching/retries.
 
 import type {
+  AskMode,
+  AskStreamEvent,
   EmailRow,
   FilterFacets,
   JobState,
@@ -60,6 +62,76 @@ export const clearIndex = () =>
 // ---------- search ----------
 
 /**
+ * Parse an NDJSON response body incrementally and yield one decoded
+ * record per line.
+ *
+ * Used by both `searchStream` and `askStream` (and any future
+ * line-delimited JSON endpoint) — the bytes-to-line dance is identical
+ * across them, only the `T` discriminator differs.
+ *
+ * - Decoded as UTF-8 with streaming reassembly so a multi-byte
+ *   character split across chunk boundaries doesn't get mangled.
+ * - One malformed line is logged + skipped; it does NOT kill the
+ *   stream. Backends occasionally emit a stray byte during shutdown
+ *   and one bad line shouldn't cost the user their entire result.
+ * - On `AbortError` (signal cancelled), the reader is cancelled in
+ *   the `finally` and the consumer's `for await` rethrows the
+ *   AbortError — that's the cancellation path the React effect
+ *   relies on.
+ */
+async function* iterNdjson<T>(
+  res: Response,
+  label: string,
+): AsyncGenerator<T> {
+  if (!res.body) {
+    throw new Error(`${label} returned no body`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIdx = buffer.indexOf('\n');
+      while (newlineIdx !== -1) {
+        const line = buffer.slice(0, newlineIdx).trim();
+        buffer = buffer.slice(newlineIdx + 1);
+        if (line) {
+          try {
+            yield JSON.parse(line) as T;
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.error(`${label}: failed to parse NDJSON line`, line, err);
+          }
+        }
+        newlineIdx = buffer.indexOf('\n');
+      }
+    }
+    // Flush any trailing partial line (well-behaved servers terminate
+    // every record with `\n`, so this is belt-and-braces for proxies
+    // that strip the trailing newline).
+    const tail = buffer.trim();
+    if (tail) {
+      try {
+        yield JSON.parse(tail) as T;
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`${label}: failed to parse trailing NDJSON line`, tail, err);
+      }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // Ignore — reader may already be closed (e.g. on abort).
+    }
+  }
+}
+
+/**
  * Stream per-leg search events from /api/search/stream.
  *
  * Each leg (keyword / semantic_fts / semantic_knn) produces a self-scored
@@ -100,61 +172,52 @@ export async function* searchStream(
     const text = await res.text().catch(() => '');
     throw new Error(`${res.status} ${res.statusText}: ${text}`);
   }
-  if (!res.body) {
-    throw new Error('search stream returned no body');
-  }
+  yield* iterNdjson<SearchStreamEvent>(res, 'searchStream');
+}
 
-  // Parse NDJSON incrementally: buffer bytes, split on '\n', JSON.parse
-  // each complete line. Anything left in the buffer at end-of-stream is
-  // a final partial line (shouldn't happen with a well-behaved server,
-  // but we still flush it).
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let buffer = '';
+// ---------- ask (RAG agent) ----------
 
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      // Process every complete line currently in the buffer.
-      let newlineIdx = buffer.indexOf('\n');
-      while (newlineIdx !== -1) {
-        const line = buffer.slice(0, newlineIdx).trim();
-        buffer = buffer.slice(newlineIdx + 1);
-        if (line) {
-          try {
-            yield JSON.parse(line) as SearchStreamEvent;
-          } catch (err) {
-            // A malformed JSON line is non-fatal — log + skip so one bad
-            // line doesn't kill the whole stream.
-            // eslint-disable-next-line no-console
-            console.error('searchStream: failed to parse NDJSON line', line, err);
-          }
-        }
-        newlineIdx = buffer.indexOf('\n');
-      }
-    }
-    // Flush any trailing partial line.
-    const tail = buffer.trim();
-    if (tail) {
-      try {
-        yield JSON.parse(tail) as SearchStreamEvent;
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error('searchStream: failed to parse trailing NDJSON line', tail, err);
-      }
-    }
-  } finally {
-    // Release the reader lock so the body can be garbage-collected. If
-    // we got here via an AbortError, `cancel()` is a no-op on an
-    // already-aborted stream.
-    try {
-      await reader.cancel();
-    } catch {
-      // Ignore — the reader may already be closed.
-    }
+/**
+ * Stream Ask agent events from POST /api/ask/stream.
+ *
+ * Wire protocol (NDJSON, one JSON record per line):
+ *   `meta` → `parsed` → `sources` → `answer_delta`* → `done`
+ * or a single `error` that replaces the rest of the stream when any
+ * step fails.
+ *
+ * The `sources` event arrives BEFORE the first `answer_delta`, so the
+ * UI can render inline `[N]` citation buttons immediately and have
+ * them resolve to the right email even while the answer is still
+ * streaming.
+ *
+ * POST (not GET) because the question body may be long and we don't
+ * want to URL-encode it. Cancellation via `AbortSignal` works the
+ * same as `searchStream` — the server notices the disconnect and the
+ * worker thread's next write to the bridge queue raises.
+ */
+export async function* askStream(
+  question: string,
+  opts: { mode?: AskMode; limit?: number },
+  signal?: AbortSignal,
+): AsyncGenerator<AskStreamEvent> {
+  const body: Record<string, unknown> = { question };
+  if (opts.mode) body.mode = opts.mode;
+  if (opts.limit != null) body.limit = opts.limit;
+
+  const res = await fetch('/api/ask/stream', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/x-ndjson',
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
   }
+  yield* iterNdjson<AskStreamEvent>(res, 'askStream');
 }
 
 export const getFilterFacets = () => api<FilterFacets>('/api/filters');

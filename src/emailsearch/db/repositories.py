@@ -20,6 +20,28 @@ from emailsearch.db.models import (
     attachments_to_json,
 )
 
+
+def _insert_chunk(conn: sqlite3.Connection, ch: Chunk) -> None:
+    """INSERT one chunk into ``vec_email_chunks``. Caller owns the txn."""
+    conn.execute(
+        """
+        INSERT INTO vec_email_chunks (
+            chunk_id, embedding,
+            email_id, source_type, source_name, chunk_index, chunk_text
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ch.chunk_id,
+            serialize_float32(ch.embedding),
+            ch.email_id,
+            ch.source_type,
+            ch.source_name,
+            ch.chunk_index,
+            ch.chunk_text,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # emails
 # ---------------------------------------------------------------------------
@@ -77,23 +99,7 @@ def insert_email_with_chunks(
             ),
         )
         for ch in chunks:
-            conn.execute(
-                """
-                INSERT INTO vec_email_chunks (
-                    chunk_id, embedding,
-                    email_id, source_type, source_name, chunk_index, chunk_text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ch.chunk_id,
-                    serialize_float32(ch.embedding),
-                    ch.email_id,
-                    ch.source_type,
-                    ch.source_name,
-                    ch.chunk_index,
-                    ch.chunk_text,
-                ),
-            )
+            _insert_chunk(conn, ch)
 
 
 def clear_all_data(conn: sqlite3.Connection) -> None:
@@ -146,23 +152,20 @@ def count_chunks(conn: sqlite3.Connection) -> int:
 def set_email_summary(conn: sqlite3.Connection, email_id: str, summary: str) -> bool:
     """Set the LLM-generated summary on an existing email row.
 
-    Three coordinated writes inside one transaction:
+    Three coordinated writes in one transaction:
 
-    1. ``UPDATE emails SET summary = ?, searchable_text = ?`` — the FTS5
-       ``emails_au`` trigger fires automatically and re-syncs the keyword
-       index.
-    2. ``DELETE FROM vec_email_chunks WHERE email_id = ? AND source_type='summary'``
-       drops any prior summary chunks so re-summarization doesn't collide
-       on the deterministic chunk id.
-    3. Insert fresh summary chunks via ``build_summary_chunks`` so semantic
-       search can match the summary's embedding in a single KNN pass.
+    1. UPDATE ``emails`` (FTS5 ``emails_au`` trigger re-syncs the keyword
+       index automatically).
+    2. DELETE prior summary chunks (so re-summarization doesn't collide
+       on the deterministic chunk id).
+    3. INSERT fresh summary chunks so semantic search can match the
+       summary's embedding in a single KNN pass.
 
-    Returns ``True`` when a row was updated, ``False`` when the email id
-    doesn't exist (caller can log + skip).
+    Returns ``False`` when the email id doesn't exist.
     """
     # Re-derive searchable_text from current body + (new) summary +
-    # attachments. We pull the body / attachments JSON directly so we don't
-    # have to round-trip a full EmailRow through pydantic.
+    # attachments. Read the columns directly to avoid round-tripping a
+    # full EmailRow through pydantic.
     row = conn.execute(
         "SELECT body_text, attachments FROM emails WHERE id = ?",
         (email_id,),
@@ -170,9 +173,8 @@ def set_email_summary(conn: sqlite3.Connection, email_id: str, summary: str) -> 
     if row is None:
         return False
 
-    # Local import to avoid a top-level cycle: build_chunks imports the
-    # encoder, which would pull the heavy embedding stack into every DB
-    # consumer.
+    # Local import to avoid a top-level cycle (build_chunks imports the
+    # encoder, which would pull the embedding stack into every DB consumer).
     from emailsearch.embed.build_chunks import build_summary_chunks
 
     parts: list[str] = []
@@ -185,10 +187,8 @@ def set_email_summary(conn: sqlite3.Connection, email_id: str, summary: str) -> 
             parts.append(a.extracted_text)
     searchable_text = " ".join(parts)
 
-    # Build summary chunks BEFORE opening the transaction: embedding is the
-    # slow step (model call) and we don't want it holding the write lock.
-    # `build_summary_chunks` returns [] for empty/whitespace input, which
-    # combined with the DELETE below cleanly purges stale summary chunks.
+    # Build summary chunks BEFORE opening the txn — embedding is the
+    # slow step and we don't want it holding the write lock.
     summary_chunks = build_summary_chunks(email_id, summary)
 
     with conn:  # transaction
@@ -201,23 +201,7 @@ def set_email_summary(conn: sqlite3.Connection, email_id: str, summary: str) -> 
             (email_id,),
         )
         for ch in summary_chunks:
-            conn.execute(
-                """
-                INSERT INTO vec_email_chunks (
-                    chunk_id, embedding,
-                    email_id, source_type, source_name, chunk_index, chunk_text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ch.chunk_id,
-                    serialize_float32(ch.embedding),
-                    ch.email_id,
-                    ch.source_type,
-                    ch.source_name,
-                    ch.chunk_index,
-                    ch.chunk_text,
-                ),
-            )
+            _insert_chunk(conn, ch)
     return result.rowcount > 0
 
 
@@ -238,21 +222,10 @@ def search_fts(
 ) -> list[FtsHit]:
     """Keyword search via FTS5. Returns hits ordered by bm25 (best first).
 
-    Column weights to ``bm25(emails_fts, 5.0, 1.0, 1.0)`` bias ranking
-    toward subject hits — most user queries describe the email's topic,
-    which lives in the subject. ``bm25`` returns lower-is-better.
-
-    Optional hard filters:
-      - ``start_at`` / ``end_at`` (epoch seconds) restrict to the
-        half-open interval ``[start_at, end_at)``.
-      - ``from_address`` matches case-insensitively.
-      - ``folder_id`` matches exactly.
-
-    Filters are applied in the SQL WHERE clause (not post-hoc) so the
-    LIMIT still returns the top-N matching hits.
-
-    Named parameters (``:name``) are used because each ``NULL OR ...``
-    filter test needs the same value twice.
+    Column weights ``bm25(emails_fts, 5.0, 1.0, 1.0)`` bias toward subject
+    hits. ``bm25`` returns lower-is-better. Optional hard filters
+    (date range, sender, folder) are applied in the WHERE clause so the
+    LIMIT returns the top-N matching hits.
     """
     rows = conn.execute(
         """

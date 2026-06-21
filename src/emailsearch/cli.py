@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-# Workaround for a Python + LlamaIndex shutdown race:
-# ``llama_index.core.ingestion.pipeline`` lazily imports
-# ``concurrent.futures.process``, which tries to register an ``atexit``
-# handler. If that import first happens during interpreter shutdown, the
-# registration fails with ``RuntimeError: can't register atexit after
-# shutdown``. Pre-importing here registers the handler early.
+# Pre-import ``concurrent.futures.process`` so its lazy atexit handler
+# registers now rather than during interpreter shutdown — LlamaIndex
+# triggers that lazy import inside a shutdown path, which raises
+# ``RuntimeError: can't register atexit after shutdown``.
 import concurrent.futures.process  # noqa: F401
 import signal
 import subprocess
@@ -27,18 +25,14 @@ app = typer.Typer(
 
 
 def _serve_with_graceful_shutdown(config: uvicorn.Config) -> None:
-    """Run uvicorn with custom signal handling that flips the cancel flag on
-    all active sync jobs the moment Ctrl+C is pressed — *before* uvicorn
-    starts tearing down the event loop.
+    """Run uvicorn with custom signal handling: flip the cancel flag on
+    every active sync job BEFORE uvicorn tears down the event loop.
 
-    Without this, uvicorn's own SIGINT handler cancels the ASGI lifespan task
-    before sending it the "shutdown" message, so our ``_lifespan`` cleanup
-    never runs and the user sees a ``KeyboardInterrupt`` + ``CancelledError``
-    traceback.
+    Without this, uvicorn's SIGINT handler cancels the ASGI lifespan
+    task before sending the "shutdown" message, so our ``_lifespan``
+    cleanup never runs and the user sees a CancelledError traceback.
     """
     server = uvicorn.Server(config)
-    # Tell uvicorn not to install its own signal handlers — ours below
-    # already drive ``server.should_exit``.
     server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
 
     interrupt_count = {"n": 0}
@@ -46,8 +40,7 @@ def _serve_with_graceful_shutdown(config: uvicorn.Config) -> None:
     def _handle_shutdown(signum: int, _frame: object | None) -> None:
         interrupt_count["n"] += 1
         if interrupt_count["n"] == 1:
-            # First Ctrl+C: cooperatively cancel every active job + ask
-            # uvicorn to shut down. Signal handlers must never raise.
+            # First Ctrl+C: cooperatively cancel jobs + ask uvicorn to shut down.
             try:
                 from emailsearch.sync.jobs import get_registry
 
@@ -63,7 +56,7 @@ def _serve_with_graceful_shutdown(config: uvicorn.Config) -> None:
                 pass
             server.should_exit = True
         else:
-            # Second Ctrl+C: hard exit. Third also forces a process exit.
+            # Second Ctrl+C: hard exit. Third forces a process exit.
             server.force_exit = True
             if interrupt_count["n"] >= 3:
                 sys.exit(130)
@@ -72,24 +65,23 @@ def _serve_with_graceful_shutdown(config: uvicorn.Config) -> None:
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _handle_shutdown)
     if hasattr(signal, "SIGBREAK"):
-        # Windows-only: produced by CTRL_BREAK_EVENT. Same handler as SIGINT.
+        # Windows-only: produced by CTRL_BREAK_EVENT.
         signal.signal(signal.SIGBREAK, _handle_shutdown)
 
     try:
         server.run()
     except KeyboardInterrupt:
-        # Our handler already initiated graceful shutdown; just exit silently.
+        # Our handler already initiated graceful shutdown.
         pass
 
 
 def _open_browser_when_ready(host: str, port: int) -> None:
-    """Background-thread entry: poll ``/api/health`` until it responds, then open the browser.
+    """Poll ``/api/health`` until it responds, then open the browser.
 
     A blind ``time.sleep`` isn't enough — uvicorn's lifespan startup
-    preloads the embedding model (multi-second on a cold machine) and
-    doesn't accept requests until lifespan startup completes. Opening the
-    browser before that races the user against model load. After
-    ``deadline`` we open anyway as a best-effort fallback.
+    preloads the embedding model (multi-second on cold start) and
+    doesn't accept requests until that completes. After ``deadline`` we
+    open anyway as a best-effort fallback.
     """
     import time
     import urllib.error
@@ -103,7 +95,6 @@ def _open_browser_when_ready(host: str, port: int) -> None:
 
     while time.monotonic() < deadline:
         try:
-            # Tight per-attempt timeout — we'd rather loop than block.
             with urllib.request.urlopen(health_url, timeout=0.5) as resp:  # noqa: S310
                 if 200 <= resp.status < 500:
                     break
@@ -168,17 +159,9 @@ def start(
 ) -> None:
     """Stop any stale server, rebuild the frontend, then start fresh + open browser.
 
-    Convenience one-liner for the dev inner-loop equivalent to:
-
-        cd frontend && npm run build && cd ..
-        # then kill any old `emailsearch serve` bound to :PORT
-        emailsearch serve --open-browser
-
-    The auto-stop step prevents the "I changed the code, why isn't anything
-    different?" confusion: Python's editable install picks up `.py` changes
-    only on process restart, and Vite's `dist/` bundle only refreshes on
-    `npm run build`. Use `serve` directly if you want `--reload`, skip the
-    build, or iterate with the Vite dev server on :5173.
+    Convenience one-liner for the dev inner-loop. Use ``serve`` directly
+    if you want ``--reload``, want to skip the build, or want to iterate
+    with the Vite dev server on :5173.
     """
     settings = get_settings()
     h = host or settings.host
@@ -207,11 +190,9 @@ def start(
 
 
 def _stop_server_on_port(port: int) -> None:
-    """Best-effort: kill any process bound to ``port`` so the new server can claim it.
-
-    Windows-only auto-stop (uses ``Get-NetTCPConnection`` + ``Stop-Process``).
-    On non-Windows we surface a clear error — this product targets Windows
-    anyway (Classic Outlook COM).
+    """Best-effort: kill the process bound to ``port`` so the new server
+    can claim it. Windows-only (uses Get-NetTCPConnection + Stop-Process)
+    because this product targets Windows + Classic Outlook COM anyway.
     """
     import socket
     import time
@@ -234,9 +215,7 @@ def _stop_server_on_port(port: int) -> None:
         )
         raise typer.Exit(code=1)
 
-    # `Get-NetTCPConnection` pipes through `Select-Object` to flatten to
-    # PID-per-line. `-ErrorAction SilentlyContinue` so the absent-row case
-    # exits 0 rather than printing a non-terminating error.
+    # ``-ErrorAction SilentlyContinue`` so the absent-row case exits 0.
     ps_cmd = (
         f"Get-NetTCPConnection -LocalPort {port} -State Listen "
         f"-ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess"
@@ -254,8 +233,8 @@ def _stop_server_on_port(port: int) -> None:
 
     pids = {int(line.strip()) for line in out.stdout.splitlines() if line.strip().isdigit()}
     if not pids:
-        # Socket said "in use" but Get-NetTCPConnection saw nothing — likely
-        # a TIME_WAIT remnant. Don't bail; the wait loop below retries.
+        # Socket said "in use" but Get-NetTCPConnection saw nothing —
+        # likely a TIME_WAIT remnant. Don't bail; the wait loop retries.
         typer.secho(
             "  no owning process found — port may be in TIME_WAIT; waiting…",
             fg=typer.colors.YELLOW,
@@ -269,8 +248,7 @@ def _stop_server_on_port(port: int) -> None:
                 timeout=5,
             )
 
-    # Poll until the socket frees. 3s budget — process teardown + socket
-    # release is usually <1s but TIME_WAIT can push it longer.
+    # Poll until the socket frees (3s budget — TIME_WAIT can push past 1s).
     for _ in range(15):
         time.sleep(0.2)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -286,11 +264,10 @@ def _stop_server_on_port(port: int) -> None:
 
 
 def _build_frontend() -> None:
-    """Run ``npm run build`` in the repo's ``frontend/`` dir, streaming output.
-
-    Assumes ``npm install`` has already been done. A failing build is fatal
-    — starting the server on top of a stale ``dist/`` is exactly the bug
-    this command exists to prevent.
+    """Run ``npm run build`` in the repo's ``frontend/`` dir, streaming
+    output. Assumes ``npm install`` is done. A failing build is fatal —
+    starting on top of a stale ``dist/`` is exactly the bug this command
+    exists to prevent.
     """
     # cli.py lives at src/emailsearch/cli.py; frontend/ is two parents up.
     frontend = Path(__file__).resolve().parents[2] / "frontend"

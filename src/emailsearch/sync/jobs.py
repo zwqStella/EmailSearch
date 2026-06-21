@@ -1,17 +1,15 @@
 """Persistent job registry for the Load button.
 
 State is mirrored to the ``sync_jobs`` SQLite table so:
+  1. Recent jobs list survives a server restart.
+  2. Still-running jobs can be cooperatively cancelled.
+  3. The user can wipe history with one click.
 
-  1. The Recent jobs list survives a server restart.
-  2. A still-running job can be cooperatively cancelled (the loader
-     checks ``is_cancel_requested()`` between messages).
-  3. The user can wipe the entire history with one click.
-
-In-memory state remains the source of truth for the running job's
-counters (low-latency mid-job updates) and the cancel flag (set by HTTP,
-read by worker thread). On every update we mirror to SQLite. On startup
-we load the most recent N jobs from SQLite into memory and force-cancel
-anything that looked "running" at shutdown.
+In-memory state is the source of truth for the running job's counters
+(low-latency mid-job updates) and the cancel flag (set by HTTP, read by
+worker thread). On every update we mirror to SQLite. On startup we
+load the most recent N jobs and force-cancel anything that looked
+"running" at shutdown.
 """
 
 from __future__ import annotations
@@ -124,9 +122,7 @@ class JobRegistry:
             # Insert oldest-first so `_order` reflects insertion order.
             for row in reversed(rows):
                 job = self._row_to_state(row)
-                # A job that was "running" at shutdown can never resume —
-                # mark it cancelled with a clear reason so the UI shows
-                # something honest.
+                # A job that was "running" at shutdown can never resume.
                 if job.status in ("pending", "running"):
                     job.status = "cancelled"
                     job.error = job.error or "Server restarted while job was running."
@@ -238,10 +234,9 @@ class JobRegistry:
         return job
 
     def _evict_old(self) -> list[str]:
-        # Caller is responsible for persisting the eviction (so DB I/O can
-        # happen outside the lock). Returns the IDs that were dropped from
-        # memory so they can be deleted from `sync_jobs` too — otherwise the
-        # on-disk table grows unbounded.
+        # Caller persists the eviction so DB I/O happens outside the lock.
+        # Returns IDs dropped from memory so they can be deleted from
+        # ``sync_jobs`` too — otherwise the on-disk table grows unbounded.
         evicted: list[str] = []
         while len(self._order) > self._max_history:
             old_id = self._order.pop(0)
@@ -305,9 +300,9 @@ class JobRegistry:
     def request_cancel_all_active(self) -> list[str]:
         """Signal cancel on every pending/running job. Returns the job IDs signaled.
 
-        Used by the server-shutdown path so background worker threads exit
-        cooperatively (otherwise non-daemon `asyncio.to_thread` threads keep
-        the interpreter alive after Ctrl+C).
+        Used by the server-shutdown path so background worker threads
+        exit cooperatively (non-daemon ``asyncio.to_thread`` threads
+        otherwise keep the interpreter alive after Ctrl+C).
         """
         with self._lock:
             cancelled: list[str] = []
@@ -349,9 +344,3 @@ def get_registry() -> JobRegistry:
         if _registry is None:
             _registry = JobRegistry()
         return _registry
-
-
-def reset_registry_for_tests() -> None:
-    global _registry
-    with _registry_lock:
-        _registry = None

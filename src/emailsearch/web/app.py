@@ -35,17 +35,14 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     """Server lifecycle hooks.
 
     Startup: eagerly load the HuggingFace embedding model so the first
-    user-facing search doesn't pay the multi-second model-load latency.
-    Dispatched to a worker thread (sentence-transformers does blocking
-    disk + tensor I/O) but awaited so FastAPI delays accepting requests
-    until the model is ready. A preload failure is logged but not fatal
-    — the lazy code path in ``encoder._get_embed_model`` is the safety
-    net.
+    user-facing search doesn't pay the model-load latency. Dispatched
+    to a worker thread (sentence-transformers does blocking I/O) but
+    awaited so FastAPI delays accepting requests until the model is
+    ready. Preload failure is logged but not fatal — the lazy code
+    path in ``encoder._get_embed_model`` is the safety net.
 
     Shutdown: signal cooperative cancel to every in-flight sync job and
-    return immediately. Workers are daemon threads (see
-    ``sync.loader.spawn_load_job``) so process exit kills them — we do
-    NOT wait for an Outlook COM ``Restrict()`` call to return.
+    return. Workers are daemon threads so process exit kills them.
     """
     from emailsearch.embed.encoder import preload_models
 
@@ -94,11 +91,12 @@ def create_app() -> FastAPI:
         }
 
     # Routers
-    from emailsearch.web.routes import search, status, sync
+    from emailsearch.web.routes import ask, search, status, sync
 
     app.include_router(status.router)
     app.include_router(sync.router)
     app.include_router(search.router)
+    app.include_router(ask.router)
 
     # Serve built frontend from / in prod (no-op in dev — React is on :5173).
     dist = _frontend_dist_dir()

@@ -1,14 +1,12 @@
 """Loader: pulls messages from local Outlook (Classic) and writes to SQLite.
 
-Idempotency contract: if ``email_exists(id)`` for the message's stable id
+Idempotency: if ``email_exists(id)`` for the message's stable id
 (Internet Message-Id when available, else Outlook EntryID), skip it.
 
-The COM client is synchronous (Outlook's automation API is in-process).
-We run the whole job inline; the caller is responsible for putting it on
-a background **daemon** thread (see ``spawn_load_job``) so the FastAPI
-event loop isn't blocked and Ctrl+C on the server exits immediately —
-daemon threads die with the process. Cooperative cancel
-(``job.is_cancel_requested()``) is still honored for responsive jobs.
+The COM client is synchronous. We run the whole job inline; the caller
+puts it on a daemon thread via ``spawn_load_job`` so Ctrl+C exits
+immediately. Cooperative cancel (``job.is_cancel_requested()``) is
+honored between messages for responsive jobs.
 """
 
 from __future__ import annotations
@@ -56,11 +54,9 @@ def spawn_load_job(
     registry: JobRegistry | None = None,
     source_factory: type[MessageSource] | None = None,
 ) -> threading.Thread:
-    """Fire-and-forget version: kicks off ``run_load_job`` on a daemon thread.
-
-    Daemon = process exit kills it instantly on Ctrl+C. Job persistence +
-    the on-restart reconciler (which marks dangling ``running`` rows as
-    ``cancelled``) keep the UI consistent.
+    """Fire-and-forget version: kicks off ``run_load_job`` on a daemon
+    thread (process exit kills it instantly on Ctrl+C). Job persistence
+    + the on-restart reconciler keep the UI consistent.
     """
     thread = threading.Thread(
         target=run_load_job,
@@ -98,14 +94,13 @@ def _run_blocking(job_id: str, registry: JobRegistry, factory: type[MessageSourc
                 start=start_dt, end=end_dt, folder_ids=job.folder_ids
             ):
                 # Cooperative cancel: checked between messages so the
-                # in-flight COM call still completes (no half-extracted state).
+                # in-flight COM call completes (no half-extracted state).
                 if job.is_cancel_requested():
                     registry.mark_cancelled(job_id)
                     return
                 _process_one_message(conn, raw, job, registry, job_id)
 
-        # The iter loop may exit because cancel was requested at the last
-        # item — re-check before declaring success.
+        # Iter may exit because cancel was requested at the last item.
         if job.is_cancel_requested():
             registry.mark_cancelled(job_id)
         else:
@@ -134,9 +129,8 @@ def _process_one_message(
 
     try:
         email = extract_email(raw)
-        # Best-effort LLM summarization. ``summarize_email`` no-ops to None
-        # when llm_enabled=False or any HTTP/parse error occurs — the email
-        # is always indexed, summary is just an optional enrichment.
+        # Best-effort LLM summarization. ``summarize_email`` returns None
+        # on disabled/failed LLM — the email is indexed either way.
         email.summary = summarize_email(email)
         chunks = build_chunks(email)
         insert_email_with_chunks(conn, email, chunks)

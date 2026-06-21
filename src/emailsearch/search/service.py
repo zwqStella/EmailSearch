@@ -4,9 +4,7 @@ Three independent **legs** — ``keyword``, ``semantic_fts``, and
 ``semantic_knn`` — each produce a self-scored list of :class:`SearchHit`.
 There is no cross-leg fusion: the caller (the streaming HTTP endpoint or
 the sync ``search`` wrapper used by tests) merges per-email scores when
-the same email surfaces in multiple legs. The HTTP layer fans the legs
-out in parallel and streams each leg's results to the browser as soon as
-it lands; the browser inserts new items by score.
+the same email surfaces in multiple legs.
 
 Score conventions (all higher = better):
   - ``keyword`` / ``semantic_fts``: ``1 / (1 + bm25_rank)``, in (0, 1].
@@ -37,6 +35,7 @@ from emailsearch.db.repositories import (
 )
 from emailsearch.embed.encoder import embed_query
 from emailsearch.summarize import augment_query, distill_query
+from emailsearch.util import contains_cjk
 
 log = logging.getLogger(__name__)
 
@@ -51,35 +50,19 @@ _DEBUG_PREVIEW_CHARS = 160
 # outranks any non-summary match WITHIN the embedding leg. Per-source
 # scores live in [0, 1] (from ``1 / (1 + distance)``), so a base of 1.0
 # cleanly separates the two buckets while keeping inner ordering
-# distance-driven. Intra-leg only — cross-leg merging is the frontend's
-# job.
+# distance-driven.
 SUMMARY_PROMOTION_BASE = 1.0
 
-# Minimum token length that the FTS5 trigram tokenizer can match. The
-# tokenizer produces no tokens for strings shorter than 3 chars, so a
-# phrase like "工会" or "Q3" returns 0 hits AND poisons any AND-joined
-# query it appears in. We strip such tokens before building the MATCH
-# expression and surface them in the per-leg trace.
+# Minimum token length the FTS5 trigram tokenizer can match. Strings
+# shorter than 3 chars (e.g. "工会", "Q3") return 0 hits and poison any
+# AND-joined query they appear in, so we strip them up-front.
 _TRIGRAM_MIN_CHARS = 3
 
-# How many extra FTS hits to fetch from SQL to leave headroom for the
-# word-boundary post-filter (:func:`_verify_fts_hit`), which can drop a
-# large fraction of hits when an ASCII fragment substring-matches a longer
-# word (e.g. "labor" matches every "collaboration"). Raw bm25 over a
-# contentless FTS5 table is sub-ms, so the over-fetch cost is negligible.
+# Over-fetch factor for the substring-false-positive post-filter
+# (:func:`_verify_fts_hit`), which can drop a large fraction of hits when
+# an ASCII fragment substring-matches a longer word ("labor" inside
+# "collaboration"). Raw bm25 is sub-ms so over-fetch cost is negligible.
 _FTS_OVERFETCH_FACTOR = 3
-
-# CJK code-point ranges. Used by :func:`_is_cjk_token` to pick matching
-# semantics: ASCII tokens use ``\b`` word boundaries; CJK tokens use
-# plain substring (no inter-character word boundaries in the script).
-_CJK_RANGES = (
-    ("\u3040", "\u309f"),  # Hiragana
-    ("\u30a0", "\u30ff"),  # Katakana
-    ("\u3400", "\u4dbf"),  # CJK Unified Ideographs Extension A
-    ("\u4e00", "\u9fff"),  # CJK Unified Ideographs
-    ("\uac00", "\ud7af"),  # Hangul Syllables
-    ("\uf900", "\ufaff"),  # CJK Compatibility Ideographs
-)
 
 FtsJoiner = Literal["AND", "OR"]
 
@@ -95,24 +78,15 @@ class SearchHit(BaseModel):
     matched_in: MatchedIn
     matched_attachment_name: str | None = None
     web_link: str | None = None
-    # LLM-generated topical summary when available, surfaced so the UI can
-    # render it above the matched-text snippet. None when summarization is
-    # disabled or generation failed for that email.
+    # LLM-generated topical summary; None when disabled or generation failed.
     summary: str | None = None
 
 
 class SearchFilters(BaseModel):
-    """Optional hard filters applied to every search mode.
-
-    Empty filter = all fields ``None``. Activating a filter narrows the
-    candidate set BEFORE ranking, so e.g. a sender filter doesn't just
-    rerank — it excludes everyone else outright.
-
-    Semantics:
-      - ``start_at`` / ``end_at`` (epoch seconds, UTC): half-open interval
-        ``[start_at, end_at)``. Either side may be omitted for an open range.
-      - ``from_address``: case-insensitive exact match.
-      - ``folder_id``: exact match (folder ids are stable opaque strings).
+    """Optional hard filters applied before ranking (active = at least one
+    field set). Date range is half-open ``[start_at, end_at)``;
+    ``from_address`` matches case-insensitively; ``folder_id`` matches
+    exactly. Empty filter = all ``None``.
     """
 
     start_at: int | None = None
@@ -127,8 +101,8 @@ class SearchFilters(BaseModel):
         )
 
     def matches(self, email: EmailRow) -> bool:
-        """Check an EmailRow against active filters (used for the semantic path
-        where we filter Python-side after the vec0 KNN)."""
+        """Check an EmailRow against active filters (used for the semantic
+        path where we filter Python-side after the vec0 KNN)."""
         if self.start_at is not None and email.received_at < self.start_at:
             return False
         if self.end_at is not None and email.received_at >= self.end_at:
@@ -144,13 +118,8 @@ class SearchFilters(BaseModel):
 
 
 class LegResult(BaseModel):
-    """One search leg's output. Streamed to the browser as a single chunk
-    when the leg finishes, or aggregated into a :class:`SearchResponse` by
-    the sync wrapper.
-
-    ``trace`` mirrors the per-leg portion of the debug payload — populated
-    only when ``debug_enabled`` is on so the lean path doesn't allocate.
-    """
+    """One search leg's output. ``trace`` is populated only when
+    ``debug_enabled`` is on so the lean path doesn't allocate."""
 
     source: LegSource
     hits: list[SearchHit]
@@ -158,18 +127,14 @@ class LegResult(BaseModel):
 
 
 class SearchResponse(BaseModel):
-    """Aggregated response used by the sync wrapper + the tests.
-
-    The streaming endpoint emits :class:`LegResult` chunks instead — it
-    never builds one of these.
-    """
+    """Aggregated response used by the sync wrapper + the tests. The
+    streaming endpoint emits :class:`LegResult` chunks instead."""
 
     hits: list[SearchHit]
     mode: SearchMode
     query: str
-    # Per-search transformation + ranking trace. Populated whenever
-    # ``settings.debug_enabled`` is True (the default); ``None`` when
-    # explicitly disabled server-side via ``EMAILSEARCH_DEBUG_ENABLED=false``.
+    # Per-search trace. Populated whenever ``settings.debug_enabled`` is
+    # True (default); ``None`` when explicitly disabled.
     debug: dict[str, Any] | None = None
 
 
@@ -179,13 +144,12 @@ class SearchResponse(BaseModel):
 
 
 def legs_for_mode(mode: SearchMode) -> list[LegSource]:
-    """The set of legs that should run for a given search mode.
+    """Legs that should run for a given mode.
 
-    - ``keyword``: the raw-query FTS leg only. No LLM hops, no embeddings.
-    - ``semantic``: distilled FTS + augmented KNN. Both LLM hops fire,
-      then run independently against the indexes.
-    - ``hybrid``: all three legs. The keyword leg adds a safety net for
-      verbatim terms the LLM transforms may have stripped.
+    - ``keyword``: raw-query FTS only (no LLM hops, no embeddings).
+    - ``semantic``: distilled FTS + augmented KNN.
+    - ``hybrid``: all three (keyword adds a safety net for verbatim
+      terms the LLM transforms may have stripped).
     """
     if mode == "keyword":
         return ["keyword"]
@@ -209,10 +173,8 @@ def run_leg(
     query = query.strip()
     if not query:
         return LegResult(source=source, hits=[], trace=None)
-    if source == "keyword":
-        return _run_keyword_leg(conn, query, limit=limit, filters=filters, debug=debug)
-    if source == "semantic_fts":
-        return _run_semantic_fts_leg(conn, query, limit=limit, filters=filters, debug=debug)
+    if source in ("keyword", "semantic_fts"):
+        return _run_fts_leg(source, conn, query, limit=limit, filters=filters, debug=debug)
     if source == "semantic_knn":
         return _run_semantic_knn_leg(conn, query, limit=limit, filters=filters, debug=debug)
     raise ValueError(f"unknown leg source: {source!r}")
@@ -233,14 +195,9 @@ def search(
 ) -> SearchResponse:
     """Run every leg for ``mode`` sequentially and merge by max score.
 
-    Sync convenience wrapper used by tests and any in-process caller that
-    wants a single fused result. The HTTP layer uses :func:`run_leg`
-    directly + streams.
-
-    Merge rule (mirrors the frontend exactly): one entry per ``email_id``;
-    if an email surfaces in multiple legs, keep the hit with the highest
-    score. Snippets / ``matched_in`` ride along with that winning hit — we
-    don't cross-merge metadata from losing legs.
+    Sync convenience wrapper used by tests / in-process callers; the HTTP
+    layer uses :func:`run_leg` directly + streams. Merge rule: one entry
+    per ``email_id``; keep the hit with the highest score.
     """
     search_started = time.perf_counter()
     query = query.strip()
@@ -265,9 +222,6 @@ def search(
         query, mode, limit, filters.is_active(), debug,
     )
 
-    # Run each leg sequentially. Order doesn't matter for the merge; we
-    # use the mode-order so the trace reads top-down like the user would
-    # expect.
     merged: dict[str, SearchHit] = {}
     for src in legs_for_mode(mode):
         leg = run_leg(src, conn, query, limit=limit, filters=filters, debug=debug)
@@ -281,24 +235,19 @@ def search(
     ranked = sorted(merged.values(), key=lambda h: h.score, reverse=True)[:limit]
     log.info("search: returning %d hit(s) for query=%r", len(ranked), query)
     if trace is not None:
-        # Overall score = best per-email score across all legs after the
-        # merge. Higher = stronger top match. KNN summary-promoted hits
-        # land in [1, 2], FTS hits in (0, 1], so an overall_score > 1
-        # means the top result was a topical (summary) match.
         trace["overall_score"] = max((h.score for h in ranked), default=0.0)
         trace["timings_ms"] = {"total_ms": _ms_since(search_started)}
-        # Mirror the full structured trace to the server log so it's
-        # visible in the uvicorn console without depending on the browser.
         log.info("search trace: %s", json.dumps(trace, default=str, ensure_ascii=False))
     return SearchResponse(hits=ranked, mode=mode, query=query, debug=trace)
 
 
 # ---------------------------------------------------------------------------
-# Leg 1: keyword — raw query → FTS
+# FTS legs (keyword + semantic_fts) — share everything except input prep
 # ---------------------------------------------------------------------------
 
 
-def _run_keyword_leg(
+def _run_fts_leg(
+    source: Literal["keyword", "semantic_fts"],
     conn: sqlite3.Connection,
     query: str,
     *,
@@ -306,168 +255,39 @@ def _run_keyword_leg(
     filters: SearchFilters,
     debug: bool,
 ) -> LegResult:
-    leg_started = time.perf_counter()
-    leg_trace: dict[str, Any] | None = {"input": query} if debug else None
-    timings_ms: dict[str, float] = {}
-    built = _to_fts_query(query, joiner="AND")
-    if leg_trace is not None:
-        leg_trace["fts_query"] = built.query
-        leg_trace["fts_joiner"] = built.joiner
-        leg_trace["fts_kept_tokens"] = built.kept_tokens
-        leg_trace["fts_dropped_short_tokens"] = built.dropped_short_tokens
-    if built.dropped_short_tokens:
-        log.info(
-            "keyword: dropped %d sub-trigram token(s): %r",
-            len(built.dropped_short_tokens), built.dropped_short_tokens,
-        )
-    if not built.query:
-        log.info("keyword: empty fts query after sanitization (raw=%r)", query)
-        _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
-        return LegResult(source="keyword", hits=[], trace=leg_trace)
-    # Over-fetch so the substring-false-positive filter has headroom; a
-    # common fragment like "labor" can otherwise drown legitimate matches
-    # out of the top-N.
-    fts_limit = max(limit * _FTS_OVERFETCH_FACTOR, 20)
-    db_started = time.perf_counter()
-    raw_fts_hits = search_fts(
-        conn,
-        built.query,
-        limit=fts_limit,
-        start_at=filters.start_at,
-        end_at=filters.end_at,
-        from_address=filters.from_address,
-        folder_id=filters.folder_id,
-    )
-    timings_ms["db_search_ms"] = _ms_since(db_started)
-    log.info(
-        "keyword: fts raw returned %d hit(s) (over-fetch=%d) for %r",
-        len(raw_fts_hits), fts_limit, built.query,
-    )
-    if not raw_fts_hits:
-        if leg_trace is not None:
-            leg_trace["fts_raw_count"] = 0
-            leg_trace["fts_substring_filtered_count"] = 0
-            leg_trace["fts_hits"] = []
-        _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
-        return LegResult(source="keyword", hits=[], trace=leg_trace)
+    """Run a bm25-based leg.
 
-    # Reject trigram substring false positives ("labor" inside
-    # "collaboration") before scoring. We need the full EmailRow because
-    # the FtsHit only carries subject + sender — the body / attachment
-    # text where the false positive lives isn't in the FTS hit projection.
-    emails = get_emails_by_ids(conn, [h.email_id for h in raw_fts_hits])
-    verified: list = []
-    for h in raw_fts_hits:
-        e = emails.get(h.email_id)
-        if e is None:
-            continue
-        if _verify_fts_hit(e, built.kept_tokens, built.joiner):
-            verified.append(h)
-    substring_filtered = len(raw_fts_hits) - len(verified)
-    if substring_filtered:
-        log.info(
-            "keyword: substring filter dropped %d/%d hit(s)",
-            substring_filtered, len(raw_fts_hits),
-        )
-    verified = verified[:limit]
-    log.info(
-        "keyword: returning %d hit(s) after filter + trim (limit=%d)",
-        len(verified), limit,
-    )
-    if leg_trace is not None:
-        leg_trace["fts_raw_count"] = len(raw_fts_hits)
-        leg_trace["fts_substring_filtered_count"] = substring_filtered
-        leg_trace["fts_hits"] = [
-            {
-                "email_id": h.email_id,
-                "subject": h.subject,
-                "from_address": h.from_address,
-                "rank": h.rank,
-            }
-            for h in verified
-        ]
-    if not verified:
-        _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
-        return LegResult(source="keyword", hits=[], trace=leg_trace)
-
-    out: list[SearchHit] = []
-    for h in verified:
-        e = emails.get(h.email_id)
-        if e is None:
-            continue
-        # Higher score = better. bm25 is more-negative-is-better; see
-        # ``_bm25_to_score`` for the conversion (the naive
-        # ``1/(1+max(0, rank))`` clamps every negative rank to 0 and
-        # collapses all hits to a flat score of 1.0).
-        score = _bm25_to_score(h.rank)
-        matched_in, matched_att = _classify_keyword_match(e, query)
-        out.append(
-            SearchHit(
-                email_id=h.email_id,
-                subject=h.subject,
-                from_address=h.from_address,
-                from_name=h.from_name,
-                received_at=h.received_at,
-                snippet=h.snippet,
-                score=score,
-                matched_in=matched_in,
-                matched_attachment_name=matched_att,
-                web_link=e.web_link,
-                summary=e.summary,
-            )
-        )
-    _finalize_leg_trace(leg_trace, leg_started, timings_ms, out)
-    return LegResult(source="keyword", hits=out, trace=leg_trace)
-
-
-# ---------------------------------------------------------------------------
-# Leg 2: semantic_fts — LLM-distilled query → FTS
-# ---------------------------------------------------------------------------
-
-
-def _run_semantic_fts_leg(
-    conn: sqlite3.Connection,
-    query: str,
-    *,
-    limit: int,
-    filters: SearchFilters,
-    debug: bool,
-) -> LegResult:
-    """FTS leg of semantic mode. The user's natural-language query is run
-    through :func:`distill_query` first to strip filler down to the bare
-    keyword phrase, and that phrase drives the bm25 search.
-
-    Joiner is **OR** (not AND like the keyword leg). The distilled output
-    is a bag of alternatives by design — bilingual translations of the
-    same concept (``工会 labor union``) plus related vocabulary — and any
-    real email matches at most one of those phrasings. AND-ing them
-    deterministically returns 0 hits; OR-ing lets each alternative
-    contribute independently.
-
-    Falls back to the raw query when ``distill_query`` returns ``None``
-    (LLM disabled / unreachable / failed).
+    ``keyword`` uses the raw query AND-joined (every typed term must match).
+    ``semantic_fts`` runs the query through :func:`distill_query` first to
+    strip filler and emit a bilingual bag of alternatives, then OR-joins
+    them (any one is enough — AND-ing the bag is contradictory and
+    returns 0 hits by construction). Falls back to the raw query when
+    distillation returns ``None``.
     """
     leg_started = time.perf_counter()
     timings_ms: dict[str, float] = {}
-    llm_started = time.perf_counter()
-    distilled = distill_query(query)
-    timings_ms["llm_preprocess_ms"] = _ms_since(llm_started)
-    fts_input = distilled if distilled else query
-    log.info(
-        "semantic_fts: raw=%r distilled=%r (fallback=%s)",
-        query, distilled, distilled is None,
-    )
-    leg_trace: dict[str, Any] | None = (
-        {
-            "raw_input": query,
-            "distilled_query": distilled,
-            "fts_input": fts_input,
-        }
-        if debug
-        else None
-    )
+    leg_trace: dict[str, Any] | None
 
-    built = _to_fts_query(fts_input, joiner="OR")
+    if source == "semantic_fts":
+        llm_started = time.perf_counter()
+        distilled = distill_query(query)
+        timings_ms["llm_preprocess_ms"] = _ms_since(llm_started)
+        fts_input = distilled if distilled else query
+        joiner: FtsJoiner = "OR"
+        log.info(
+            "semantic_fts: raw=%r distilled=%r (fallback=%s)",
+            query, distilled, distilled is None,
+        )
+        leg_trace = (
+            {"raw_input": query, "distilled_query": distilled, "fts_input": fts_input}
+            if debug else None
+        )
+    else:
+        fts_input = query
+        joiner = "AND"
+        leg_trace = {"input": query} if debug else None
+
+    built = _to_fts_query(fts_input, joiner=joiner)
     if leg_trace is not None:
         leg_trace["fts_query"] = built.query
         leg_trace["fts_joiner"] = built.joiner
@@ -475,12 +295,14 @@ def _run_semantic_fts_leg(
         leg_trace["fts_dropped_short_tokens"] = built.dropped_short_tokens
     if built.dropped_short_tokens:
         log.info(
-            "semantic_fts: dropped %d sub-trigram token(s): %r",
-            len(built.dropped_short_tokens), built.dropped_short_tokens,
+            "%s: dropped %d sub-trigram token(s): %r",
+            source, len(built.dropped_short_tokens), built.dropped_short_tokens,
         )
     if not built.query:
+        if source == "keyword":
+            log.info("keyword: empty fts query after sanitization (raw=%r)", query)
         _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
-        return LegResult(source="semantic_fts", hits=[], trace=leg_trace)
+        return LegResult(source=source, hits=[], trace=leg_trace)
 
     fts_limit = max(limit * _FTS_OVERFETCH_FACTOR, 20)
     db_started = time.perf_counter()
@@ -495,8 +317,8 @@ def _run_semantic_fts_leg(
     )
     timings_ms["db_search_ms"] = _ms_since(db_started)
     log.info(
-        "semantic_fts: fts raw (distilled=%r -> %r, over-fetch=%d) returned %d hit(s)",
-        fts_input, built.query, fts_limit, len(raw_fts_hits),
+        "%s: fts raw (query=%r, over-fetch=%d) returned %d hit(s)",
+        source, built.query, fts_limit, len(raw_fts_hits),
     )
     if not raw_fts_hits:
         if leg_trace is not None:
@@ -504,29 +326,27 @@ def _run_semantic_fts_leg(
             leg_trace["fts_substring_filtered_count"] = 0
             leg_trace["fts_hits"] = []
         _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
-        return LegResult(source="semantic_fts", hits=[], trace=leg_trace)
+        return LegResult(source=source, hits=[], trace=leg_trace)
 
-    # Reject trigram substring false positives. With OR joiner, a single
-    # token like "labor" inside an LLM-distilled bag would otherwise
-    # surface every "collaboration" mention in the corpus.
+    # Reject trigram substring false positives ("labor" inside
+    # "collaboration"). Needs the full EmailRow because FtsHit only
+    # carries subject + sender, not body / attachment text.
     emails = get_emails_by_ids(conn, [h.email_id for h in raw_fts_hits])
-    verified: list = []
-    for h in raw_fts_hits:
-        e = emails.get(h.email_id)
-        if e is None:
-            continue
-        if _verify_fts_hit(e, built.kept_tokens, built.joiner):
-            verified.append(h)
+    verified = [
+        h for h in raw_fts_hits
+        if (e := emails.get(h.email_id)) is not None
+        and _verify_fts_hit(e, built.kept_tokens, built.joiner)
+    ]
     substring_filtered = len(raw_fts_hits) - len(verified)
     if substring_filtered:
         log.info(
-            "semantic_fts: substring filter dropped %d/%d hit(s)",
-            substring_filtered, len(raw_fts_hits),
+            "%s: substring filter dropped %d/%d hit(s)",
+            source, substring_filtered, len(raw_fts_hits),
         )
     verified = verified[:limit]
     log.info(
-        "semantic_fts: returning %d hit(s) after filter + trim (limit=%d)",
-        len(verified), limit,
+        "%s: returning %d hit(s) after filter + trim (limit=%d)",
+        source, len(verified), limit,
     )
     if leg_trace is not None:
         leg_trace["fts_raw_count"] = len(raw_fts_hits)
@@ -542,14 +362,13 @@ def _run_semantic_fts_leg(
         ]
     if not verified:
         _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
-        return LegResult(source="semantic_fts", hits=[], trace=leg_trace)
+        return LegResult(source=source, hits=[], trace=leg_trace)
 
     out: list[SearchHit] = []
     for h in verified:
         e = emails.get(h.email_id)
         if e is None:
             continue
-        score = _bm25_to_score(h.rank)
         matched_in, matched_att = _classify_keyword_match(e, fts_input)
         out.append(
             SearchHit(
@@ -559,7 +378,7 @@ def _run_semantic_fts_leg(
                 from_name=h.from_name,
                 received_at=h.received_at,
                 snippet=h.snippet,
-                score=score,
+                score=_bm25_to_score(h.rank),
                 matched_in=matched_in,
                 matched_attachment_name=matched_att,
                 web_link=e.web_link,
@@ -567,7 +386,7 @@ def _run_semantic_fts_leg(
             )
         )
     _finalize_leg_trace(leg_trace, leg_started, timings_ms, out)
-    return LegResult(source="semantic_fts", hits=out, trace=leg_trace)
+    return LegResult(source=source, hits=out, trace=leg_trace)
 
 
 # ---------------------------------------------------------------------------
@@ -783,12 +602,10 @@ def _run_semantic_knn_leg(
 
 def _ms_since(start: float) -> float:
     """Milliseconds elapsed since ``start`` (from ``time.perf_counter``),
-    rounded to 3 decimals (microsecond resolution).
+    rounded to 3 decimals.
 
-    Integer milliseconds truncate every sub-ms step to ``0``, which makes
-    the trace useless for the fast paths (vec0 KNN, cached-model embed,
-    empty-result FTS). Floats keep the signal without flooding the
-    payload with sub-microsecond noise.
+    Integer milliseconds truncate sub-ms steps to ``0`` which makes the
+    trace useless for fast paths (vec0 KNN, cached embed, empty FTS).
     """
     return round((time.perf_counter() - start) * 1000, 3)
 
@@ -799,22 +616,12 @@ def _finalize_leg_trace(
     timings_ms: dict[str, float],
     hits: list[SearchHit],
 ) -> None:
-    """Stamp the leg trace with ``total_ms`` + ``overall_score`` just before
-    the leg returns.
+    """Stamp ``total_ms`` + ``overall_score`` on the leg trace before return.
 
-    No-op when ``leg_trace`` is ``None`` (debug disabled). Called from
-    every return path in each leg so the trace shape is identical
-    regardless of which early-exit fired.
-
-    - ``timings_ms`` is mutated in place to append ``total_ms``; per-step
-      keys (``llm_preprocess_ms`` / ``embedding_ms`` / ``db_search_ms``)
-      are populated by the leg as those steps complete and remain absent
-      when the leg short-circuits before reaching them. All values are
-      floats with microsecond resolution (see :func:`_ms_since`).
-    - ``overall_score`` is the max hit score returned by this leg, or
-      ``0.0`` when the leg produced no hits. Higher = better; comparable
-      within a leg only (the KNN summary promotion lifts scores into
-      ``[1, 2]`` while FTS legs stay in ``(0, 1)``)."""
+    No-op when ``leg_trace`` is ``None``. Mutates ``timings_ms`` in place
+    to append ``total_ms``. ``overall_score`` is the max hit score (0.0
+    when ``hits`` is empty).
+    """
     if leg_trace is None:
         return
     timings_ms["total_ms"] = _ms_since(leg_started)
@@ -823,22 +630,14 @@ def _finalize_leg_trace(
 
 
 def _bm25_to_score(rank: float) -> float:
-    """Convert a SQLite FTS5 ``bm25()`` rank into a (0, 1) score where
-    higher = better match.
+    """Convert an FTS5 ``bm25()`` rank into a (0, 1) score where higher = better.
 
-    SQLite's ``bm25(...)`` returns NEGATIVE numbers; the more negative,
-    the stronger the match (the repository sorts ``ORDER BY rank`` —
-    most-negative first — for this exact reason). The naive formula
-    ``1 / (1 + max(0, rank))`` clamps every real negative rank to 0 and
-    collapses ALL hits to a score of exactly ``1.0``, which is why every
-    FTS-only search used to report ``overall_score == 1.000`` regardless
-    of match quality.
-
-    We negate first to get a "goodness" magnitude (larger = stronger),
-    then squash through ``g / (1 + g)`` so the score asymptotes to 1.0
-    for very strong matches and decays toward 0.0 for weak ones. The
-    floor at 0 protects against any spurious non-negative bm25 result
-    (e.g. a degenerate single-token match)."""
+    SQLite's bm25 returns NEGATIVE numbers (more negative = stronger).
+    We negate to get a "goodness" magnitude then squash through
+    ``g / (1 + g)`` so scores asymptote to 1.0 for very strong matches
+    and decay toward 0.0 for weak ones. The floor at 0 protects against
+    any spurious non-negative result.
+    """
     goodness = max(0.0, -rank)
     return goodness / (1.0 + goodness)
 
@@ -854,21 +653,13 @@ def _preview(s: str | None) -> str:
 
 
 class _FtsQueryBuild(NamedTuple):
-    """Result of :func:`_to_fts_query`. Bundles the SQL-ready MATCH
-    expression with the per-token bookkeeping each search leg surfaces
-    in its trace.
+    """Result of :func:`_to_fts_query`.
 
-    Attributes:
-      query: The final MATCH expression. ``""`` signals "skip the search"
-        (no usable tokens survived).
-      kept_tokens: Tokens that made it into ``query`` (in input order).
-      dropped_short_tokens: Tokens dropped because they were shorter than
-        :data:`_TRIGRAM_MIN_CHARS` and therefore unmatchable by the
-        trigram tokenizer. Surfaced so the user can see why their 2-char
-        keyword (``工会``, ``Q3``) had no effect.
-      joiner: ``"AND"`` or ``"OR"`` — mirrors the operator the tokens were
-        joined with. Informational; lets the trace explain the per-leg
-        semantics without callers re-deriving them.
+    Bundles the SQL-ready MATCH expression with the per-token bookkeeping
+    each search leg surfaces in its trace. ``query == ""`` signals
+    "skip the search" (no usable tokens survived). ``dropped_short_tokens``
+    is surfaced so the user can see why their 2-char keyword (e.g.
+    ``工会``, ``Q3``) had no effect.
     """
 
     query: str
@@ -884,34 +675,21 @@ def _to_fts_query(
 ) -> _FtsQueryBuild:
     """Convert a user query string into a safe FTS5 MATCH expression.
 
-    FTS5 has a punctuation-heavy mini-grammar — ``"`` and ``'`` both
-    delimit phrases, ``*`` is a prefix operator, ``( ) : - + ^`` are
-    syntax, and bare ``AND`` / ``OR`` / ``NOT`` are operators. Passing a
-    raw user query straight to MATCH crashes with ``syntax error`` on
-    anything from a contraction (``don't``) to an email address fragment
-    (``kai'xin``) to a Windows path (``C:\\foo``).
+    Raw user input crashes FTS5's mini-grammar on anything from a
+    contraction (``don't``) to a Windows path (``C:\\foo``). We
+    tokenize on whitespace, drop tokens shorter than
+    :data:`_TRIGRAM_MIN_CHARS` (unmatchable by the trigram tokenizer),
+    escape embedded ``"`` per FTS5 rules (``"`` → ``""``), and wrap each
+    survivor as a quoted phrase.
 
-    Strategy: tokenize on whitespace, drop tokens shorter than
-    :data:`_TRIGRAM_MIN_CHARS` (the trigram tokenizer can't match them),
-    escape any embedded ``"`` per FTS5 rules (doubled — ``"`` → ``""``),
-    and wrap each surviving token as a quoted phrase. Returns an empty
-    ``query`` (signalling "skip the search") when no token survives.
-
-    ``joiner`` semantics:
-      - ``"AND"`` (default): every token must match — right for the
-        verbatim keyword leg.
-      - ``"OR"``: any token matching is enough — right for the
-        semantic_fts leg, whose input is the distilled bilingual bag of
-        alternatives from :func:`distill_query`. AND-ing those would be
-        contradictory and deterministically return 0 hits.
+    ``joiner="AND"`` (every token required) suits the verbatim keyword
+    leg; ``"OR"`` (any token enough) suits the semantic_fts leg whose
+    input is a bag of alternatives.
     """
     raw_tokens = query.split()
     kept: list[str] = []
     dropped: list[str] = []
     for t in raw_tokens:
-        # Length check is on the raw whitespace-split token. A 2-char
-        # token is unmatchable by trigram regardless of whether it
-        # contains punctuation, so there's no need to strip quotes first.
         if len(t) < _TRIGRAM_MIN_CHARS:
             dropped.append(t)
         else:
@@ -925,14 +703,11 @@ def _to_fts_query(
             joiner=joiner,
         )
 
-    # Per FTS5 docs: 'To include a double-quote character within a string,
-    # escape it by doubling it (i.e. use "").' Apostrophe is also a phrase
-    # delimiter but does NOT have a doubling-escape — wrapping in `"..."`
-    # makes it literal, which is what we want.
+    # FTS5: doubled ``"`` is the escape for an embedded quote inside a
+    # ``"..."`` phrase. Implicit AND is whitespace; OR must be uppercase
+    # (lowercase ``or`` would be parsed as a phrase token).
     escaped = [t.replace('"', '""') for t in kept]
     phrases = [f'"{t}"' for t in escaped]
-    # Implicit AND is just whitespace between phrases; OR must be spelled
-    # out (uppercase — lowercase ``or`` would be parsed as a phrase token).
     sep = " " if joiner == "AND" else " OR "
     return _FtsQueryBuild(
         query=sep.join(phrases),
@@ -943,34 +718,23 @@ def _to_fts_query(
 
 
 def _is_cjk_token(token: str) -> bool:
-    """True iff ``token`` contains any CJK character (see :data:`_CJK_RANGES`).
+    """True iff ``token`` contains any CJK character.
 
-    Used by :func:`_verify_fts_hit` to decide which matching semantics to
-    apply per token: CJK gets substring matching (no inter-character word
-    boundaries in the script), ASCII gets ``\\b`` word-boundary matching
-    (so ``labor`` doesn't match ``collaboration``).
+    Used by :func:`_verify_fts_hit` to choose matching semantics: CJK
+    gets substring matching (no inter-character word boundaries); ASCII
+    gets ``\\b`` word-boundary matching.
     """
-    for ch in token:
-        for lo, hi in _CJK_RANGES:
-            if lo <= ch <= hi:
-                return True
-    return False
+    return contains_cjk(token)
 
 
 def _token_appears_with_boundary(token_lower: str, text_lower: str) -> bool:
     """Does ``token_lower`` appear in ``text_lower`` with the right matching
     semantics for its script?
 
-    Both arguments must already be lowercased.
-
-    - **ASCII token**: requires a ``\\b`` word boundary BEFORE the match.
-      Rejects trigram's substring false positives (``labor`` inside
-      ``collaboration``) while still accepting legitimate suffixes
-      (``labor`` matches ``labors`` / ``laborer`` / ``laboring``).
-    - **CJK token**: plain substring match. Python's ``\\b`` is defined on
-      ``\\w`` which excludes CJK characters, so a regex boundary anchor
-      would never match. Substring is also what the trigram index
-      produces for CJK and what the user expects.
+    Both arguments must already be lowercased. ASCII tokens require a
+    ``\\b`` word boundary before the match (rejects ``labor`` inside
+    ``collaboration``). CJK tokens fall back to substring — Python's
+    ``\\b`` is defined on ``\\w`` which excludes CJK characters.
     """
     if _is_cjk_token(token_lower):
         return token_lower in text_lower
@@ -982,30 +746,17 @@ def _verify_fts_hit(
     kept_tokens: list[str],
     joiner: FtsJoiner,
 ) -> bool:
-    """Post-filter for FTS hits to compensate for the trigram tokenizer's
-    pure-substring matching against ASCII text.
+    """Post-filter for FTS hits to compensate for trigram's pure-substring
+    matching against ASCII text.
 
-    Trigram indexes overlapping 3-character shingles. That's what makes
-    CJK searchable (no whitespace tokens in CJK) but for ASCII it means
-    a query token ``labor`` matches every email containing
-    ``collaboration``, ``belabor``, ``laboratory``, etc.
-
-    This filter checks each ASCII token against the email's combined
-    searchable text with a regex ``\\b`` anchor; CJK tokens fall back to
-    substring matching. The ``joiner`` mirrors the FTS query's semantics:
-    ``"AND"`` requires every token to match legitimately (keyword leg);
-    ``"OR"`` requires at least one (semantic_fts leg).
-
-    Returns ``True`` (keep the hit) when ``kept_tokens`` is empty — the
-    leg already short-circuits before calling us in that case, but the
-    explicit guard makes this function safe to call standalone.
+    Trigram indexes overlapping 3-char shingles — required for CJK (no
+    whitespace tokens) but for ASCII it makes ``labor`` match
+    ``collaboration``. We re-check each ASCII token against the email's
+    searchable text with a ``\\b`` anchor; CJK tokens use substring.
+    Returns ``True`` when ``kept_tokens`` is empty (defensive guard).
     """
     if not kept_tokens:
         return True
-    # Haystack from every FTS-indexed column. ``searchable_text`` already
-    # covers body + summary + attachment text; ``subject`` and
-    # ``from_address`` are stored separately and indexed by their own FTS
-    # columns.
     text_lower = " ".join(
         s.lower()
         for s in (email.subject, email.from_address, email.searchable_text)

@@ -1,31 +1,22 @@
 """Search + email-detail routes.
 
-The /api/search/stream endpoint is the primary search entrypoint. It runs
-each leg (keyword / semantic_fts / semantic_knn) in parallel via
-``asyncio.to_thread`` and emits one NDJSON line per leg as soon as that
-leg finishes — no waiting for the slowest leg, no cross-leg fusion. The
-browser inserts incoming hits at their correct position by score (see
-``frontend/src/pages/SearchPage.tsx``).
-
-NDJSON over SSE because ``fetch`` + ``ReadableStream`` gives us native
-``AbortController`` cancellation when the user changes query mid-flight,
-and one JSON object per line is trivially parseable.
+The /api/search/stream endpoint is the primary search entrypoint. It
+runs each leg in parallel via ``asyncio.to_thread`` and emits one NDJSON
+line per leg as soon as it finishes — no waiting for the slowest leg,
+no cross-leg fusion. The browser inserts incoming hits at their correct
+position by score.
 
 Wire format (one JSON object per line, separated by ``\n``):
-  {"type":"meta","query":"...","mode":"...","sources":["keyword",...]}
+  {"type":"meta", ...}
   {"type":"hits","source":"keyword","hits":[...],"trace":{...}}
-  {"type":"hits","source":"semantic_knn","hits":[...],"trace":{...}}
-  {"type":"hits","source":"semantic_fts","hits":[...],"trace":{...}}
+  {"type":"hits","source":"semantic_knn", ...}
+  {"type":"hits","source":"semantic_fts", ...}
   {"type":"done","duration_ms":1234}
-
-The ``hits`` events arrive in leg-completion order (usually FTS legs
-first, embedding leg last).
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sqlite3
 import time
@@ -46,19 +37,14 @@ from emailsearch.db.repositories import (
 from emailsearch.search.service import (
     LegResult,
     SearchFilters,
-    SearchMode,
     legs_for_mode,
     run_leg,
 )
+from emailsearch.web.routes import ndjson_line
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["search"])
-
-
-def _ndjson(payload: dict) -> bytes:
-    """Encode one NDJSON record (compact JSON + trailing newline)."""
-    return (json.dumps(payload, default=str, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 async def _run_leg_in_thread(
@@ -70,12 +56,12 @@ async def _run_leg_in_thread(
     filters: SearchFilters,
     debug: bool,
 ) -> LegResult:
-    """Run a single search leg on a worker thread with its own SQLite connection.
+    """Run a single leg on a worker thread with its own SQLite connection.
 
-    A dedicated connection per leg is the simplest way to get true
-    parallelism out of SQLite + WAL mode for read-only queries. The
-    embedding leg's slow LLM hop holds no DB lock, so FTS legs return in
-    milliseconds even when augmentation takes a couple of seconds.
+    A dedicated connection per leg gives true parallelism out of SQLite
+    + WAL for read-only queries. The embedding leg's slow LLM hop holds
+    no DB lock so FTS legs return in milliseconds even when augmentation
+    takes a couple of seconds.
     """
 
     def _work() -> LegResult:
@@ -114,12 +100,7 @@ async def search_stream_endpoint(
         None, description="Exact match on folder_id."
     ),
 ) -> StreamingResponse:
-    """Stream per-leg search results as NDJSON.
-
-    See module docstring for the wire format. The response uses
-    ``application/x-ndjson``; each ``yield`` is flushed to the socket as
-    soon as it lands.
-    """
+    """Stream per-leg search results as NDJSON. See module docstring for wire format."""
     settings = get_settings()
     debug = settings.debug_enabled
     filters = SearchFilters(
@@ -138,17 +119,12 @@ async def search_stream_endpoint(
 
     async def _generate() -> AsyncIterator[bytes]:
         started_at = time.perf_counter()
-        # Running max across every leg's hits. Mirrors the sync
-        # wrapper's ``overall_score`` (max of merged hits): since the
-        # frontend's per-email merge rule is also "keep the higher
-        # score", the max across raw leg hits equals the max across the
-        # merged set, so we can compute it incrementally without
-        # buffering.
+        # Running max across every leg's hits. Per-email merge rule is
+        # also "keep higher score", so max across raw leg hits equals
+        # max across the merged set — compute incrementally.
         overall_score = 0.0
 
-        # Meta first so the browser knows how many legs to expect before
-        # any results land.
-        yield _ndjson({
+        yield ndjson_line({
             "type": "meta",
             "query": q,
             "mode": mode,
@@ -158,18 +134,15 @@ async def search_stream_endpoint(
         })
 
         if not q.strip():
-            # Empty query → no legs. Emit done immediately so the browser
-            # stops its "Searching..." spinner.
-            yield _ndjson({
+            yield ndjson_line({
                 "type": "done",
                 "duration_ms": 0,
                 "overall_score": 0.0,
             })
             return
 
-        # Kick off every leg in parallel. Each leg is wrapped in a tagged
-        # coroutine so the as_completed loop can identify which source
-        # failed without relying on task identity.
+        # Each leg wrapped in a tagged coroutine so as_completed knows
+        # which source failed without relying on task identity.
         async def _tagged(src: str) -> tuple[str, LegResult | BaseException]:
             try:
                 result = await _run_leg_in_thread(
@@ -188,12 +161,11 @@ async def search_stream_endpoint(
             for coro in asyncio.as_completed(tasks):
                 src, payload = await coro
                 if isinstance(payload, BaseException):
-                    # One leg crashing must not take the others down.
                     log.exception(
                         "search/stream: leg %s failed", src,
                         exc_info=(type(payload), payload, payload.__traceback__),
                     )
-                    yield _ndjson({
+                    yield ndjson_line({
                         "type": "error",
                         "source": src,
                         "message": f"{type(payload).__name__}: {payload}",
@@ -202,21 +174,21 @@ async def search_stream_endpoint(
                 for hit in payload.hits:
                     if hit.score > overall_score:
                         overall_score = hit.score
-                yield _ndjson({
+                yield ndjson_line({
                     "type": "hits",
                     "source": payload.source,
                     "hits": [h.model_dump() for h in payload.hits],
                     "trace": payload.trace,
                 })
         finally:
-            # Cancel any still-running legs if the client disconnects
-            # mid-stream so we don't leak DB connections / threadpool slots.
+            # Cancel still-running legs on client disconnect to avoid
+            # leaking DB connections / threadpool slots.
             for t in tasks:
                 if not t.done():
                     t.cancel()
 
         duration_ms = int((time.perf_counter() - started_at) * 1000)
-        yield _ndjson({
+        yield ndjson_line({
             "type": "done",
             "duration_ms": duration_ms,
             "overall_score": overall_score,
@@ -225,9 +197,8 @@ async def search_stream_endpoint(
     return StreamingResponse(
         _generate(),
         media_type="application/x-ndjson",
-        # Disable intermediate buffering — without this some reverse proxies
-        # (and Starlette's gzip middleware) coalesce per-leg yields into a
-        # single response chunk, defeating streaming.
+        # Disable intermediate buffering — some reverse proxies and
+        # Starlette's gzip middleware coalesce per-leg yields otherwise.
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",

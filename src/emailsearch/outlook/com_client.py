@@ -34,11 +34,9 @@ log = logging.getLogger(__name__)
 
 # --- Outlook constants we care about. Documented values; safe to inline. ----
 
-OL_FOLDER_INBOX = 6
 OL_MAIL_ITEM_TYPE = 0  # DefaultItemType for mail folders
 OL_RECIPIENT_TO = 1
 OL_RECIPIENT_CC = 2
-OL_RECIPIENT_BCC = 3
 
 # `Class` discriminator: 43 = MailItem. We skip non-mail (meeting requests = 53,
 # tasks = 48, contacts = 40, etc.) — they live in mail folders sometimes.
@@ -47,7 +45,6 @@ OL_OBJECT_CLASS_MAIL = 43
 # DASL property URIs for items we can't get via the high-level API.
 PR_INTERNET_MESSAGE_ID = "http://schemas.microsoft.com/mapi/proptag/0x1035001F"
 PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
-PR_ATTACH_DATA_BIN = "http://schemas.microsoft.com/mapi/proptag/0x37010102"
 PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
 
 
@@ -549,8 +546,8 @@ class OutlookClient:
             ra.skipped_reason = f"too_large:{size}>{self._max_attachment_bytes}"
             return ra
 
-        # Save to a temp file then read bytes. SaveAsFile is the most reliable
-        # path; PR_ATTACH_DATA_BIN works for some types but not all.
+        # Save to a temp file then read bytes. SaveAsFile is the most
+        # reliable path for arbitrary attachment types.
         try:
             assert self._tempdir is not None
             fd, path = tempfile.mkstemp(prefix="att-", suffix=ext or ".bin", dir=self._tempdir.name)
