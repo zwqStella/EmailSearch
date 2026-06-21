@@ -28,6 +28,16 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 export const getOutlookStatus = () => api<OutlookStatus>('/api/outlook/status');
 export const triggerOutlookSync = () =>
   api<{ ok: boolean; detail: string }>('/api/outlook/sync', { method: 'POST' });
+/** Open an indexed email in the local Outlook app (Classic Outlook via
+ *  COM). Backend resolves the stored EntryID and calls Display() — the
+ *  ``outlook:<EntryID>`` URL scheme used previously is NOT registered
+ *  with Windows and fails browser-side with "scheme does not have a
+ *  registered handler". */
+export const openEmailInOutlook = (emailId: string) =>
+  api<{ ok: boolean; detail: string }>(
+    `/api/outlook/open/${encodeURIComponent(emailId)}`,
+    { method: 'POST' },
+  );
 
 // ---------- sync ----------
 export const startLoad = (body: { start: string; end: string; folder_ids?: string[] | null }) =>

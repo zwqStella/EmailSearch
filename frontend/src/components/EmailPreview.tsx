@@ -1,6 +1,8 @@
 import { useMemo, useState } from 'react';
+import { useMutation } from '@tanstack/react-query';
 import DOMPurify from 'dompurify';
 import type { AttachmentRecord, EmailRow } from '../api/types';
+import { openEmailInOutlook } from '../api/client';
 
 function fmtDate(epoch: number): string {
   return new Date(epoch * 1000).toLocaleString();
@@ -30,6 +32,40 @@ export default function EmailPreview({ email }: { email: EmailRow }) {
   // extract/pipeline.py). DOMPurify strips any active content.
   const sanitized = useMemo(() => DOMPurify.sanitize(email.body_html), [email.body_html]);
 
+  // `web_link` may be:
+  //   - https URL (Graph ``webLink``, if a future loader produces one)
+  //     → render as a normal target="_blank" anchor; the browser opens
+  //     it directly.
+  //   - ``outlook:<EntryID>`` (Classic Outlook via COM) → the
+  //     ``outlook:`` scheme is NOT registered with Windows, so a plain
+  //     anchor fails with "scheme does not have a registered handler".
+  //     We POST to /api/outlook/open/{email_id} which uses COM
+  //     (``Namespace.GetItemFromID(...).Display()``) to drive Outlook
+  //     to the right item. The backend already has a live COM session
+  //     for loads / status checks — reusing it is cheap and avoids the
+  //     unregistered-scheme problem entirely.
+  const isHttpLink = !!email.web_link && /^https?:\/\//i.test(email.web_link);
+
+  const openMutation = useMutation({ mutationFn: openEmailInOutlook });
+  const handleOpenInOutlook = () => {
+    if (openMutation.isPending) return;
+    openMutation.mutate(email.id);
+  };
+
+  // Result string from the most recent backend response, surfaced
+  // briefly next to the button so a failed open ("could not find
+  // message in Outlook — it may have moved folders since indexing")
+  // doesn't disappear silently.
+  const openStatusText = openMutation.isPending
+    ? 'Opening…'
+    : openMutation.data
+      ? openMutation.data.ok
+        ? null  // success — Outlook is open; no need to clutter the header
+        : openMutation.data.detail
+      : openMutation.error
+        ? (openMutation.error as Error).message
+        : null;
+
   return (
     <div className="h-full flex flex-col">
       <div className="p-4 border-b">
@@ -38,16 +74,30 @@ export default function EmailPreview({ email }: { email: EmailRow }) {
             {email.subject || '(no subject)'}
           </h2>
           {email.web_link && (
-            <a
-              href={email.web_link}
-              target="_blank"
-              rel="noreferrer"
-              className="text-xs text-blue-700 underline whitespace-nowrap mt-1"
-            >
-              Open in Outlook
-            </a>
+            isHttpLink ? (
+              <a
+                href={email.web_link}
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs text-blue-700 underline whitespace-nowrap mt-1"
+              >
+                Open in Outlook
+              </a>
+            ) : (
+              <button
+                type="button"
+                onClick={handleOpenInOutlook}
+                disabled={openMutation.isPending}
+                className="text-xs text-blue-700 underline whitespace-nowrap mt-1 disabled:opacity-60"
+              >
+                {openMutation.isPending ? 'Opening…' : 'Open in Outlook'}
+              </button>
+            )
           )}
         </div>
+        {openStatusText && (
+          <div className="text-xs text-red-700 mt-1">{openStatusText}</div>
+        )}
         <div className="text-sm text-gray-700 mt-1">
           {email.from_name ? `${email.from_name} <${email.from_address}>` : email.from_address}
         </div>

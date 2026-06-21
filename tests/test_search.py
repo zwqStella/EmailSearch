@@ -572,6 +572,54 @@ def test_keyword_search_prefers_subject_match(conn) -> None:
     )
 
 
+def test_keyword_leg_score_differentiates_strong_and_weak_matches(conn) -> None:
+    """Regression: the bm25-to-score conversion must reflect match
+    quality \u2014 a strong (subject) match must score strictly higher than
+    a weak (single body mention) match.
+
+    The previous formula was ``1 / (1 + max(0, rank))``. SQLite's
+    ``bm25()`` returns NEGATIVE numbers (more negative = better), so
+    ``max(0, rank)`` clamped every real hit to 0 and collapsed all
+    scores to a flat ``1.0`` \u2014 which then propagated up as a useless
+    ``overall_score == 1.000`` regardless of actual match quality."""
+    # Strong: 'budget' is the subject. bm25 with the 5x subject weight
+    # gives a much more negative rank than a single-body mention.
+    insert_email_with_chunks(
+        conn,
+        _email("strong", "budget", "see deck"),
+        [_chunk("strong", 0, "see deck", seed=0.5)],
+    )
+    # Weak: 'budget' appears once in a long body.
+    insert_email_with_chunks(
+        conn,
+        _email(
+            "weak",
+            "weekly status",
+            "many topics today including budget reviews and other things",
+        ),
+        [_chunk(
+            "weak", 0,
+            "many topics today including budget reviews and other things",
+            seed=0.51,
+        )],
+    )
+    resp = search_service.search(conn, "budget", mode="keyword")
+    by_id = {h.email_id: h for h in resp.hits}
+    assert "strong" in by_id and "weak" in by_id
+    # Strict inequality \u2014 the bug-fix is that scores actually
+    # differentiate, not that they collapse to the same value.
+    assert by_id["strong"].score > by_id["weak"].score, (
+        f"strong subject match must score higher than weak body mention; "
+        f"strong={by_id['strong'].score!r} weak={by_id['weak'].score!r}"
+    )
+    # Both stay strictly inside (0, 1) \u2014 the formula asymptotes to 1
+    # for very strong matches but never reaches it.
+    for h in resp.hits:
+        assert 0.0 < h.score < 1.0, (
+            f"keyword score for {h.email_id!r} out of (0, 1): {h.score!r}"
+        )
+
+
 def test_search_hit_carries_llm_summary(conn) -> None:
     """When `email.summary` is set, every SearchHit for that email exposes it
     so the UI can render a 'topical summary' card above the snippet."""
@@ -1183,6 +1231,260 @@ def test_debug_preview_truncates_long_chunk_text(conn) -> None:
     assert all(len(p) <= search_service._DEBUG_PREVIEW_CHARS + 1 for p in previews)
     # And at least one preview was actually truncated.
     assert any(p.endswith("…") for p in previews)
+
+
+# ---------------------------------------------------------------------------
+# Trace metrics — per-step timings + overall_score
+# ---------------------------------------------------------------------------
+
+
+def test_trace_records_overall_score_and_total_ms_at_top_level(conn) -> None:
+    """The top-level debug payload exposes a single ``overall_score``
+    (max merged hit score) plus a ``timings_ms.total_ms`` for the whole
+    search. ``overall_score`` is the most useful one-number summary of
+    search quality — higher = stronger top match."""
+    _seed_corpus(conn)
+    resp = search_service.search(conn, "alpha", mode="hybrid")
+    assert resp.debug is not None
+    # overall_score equals the top hit's score (the merged-list sort
+    # puts the strongest match first).
+    assert resp.hits, "expected at least one hit"
+    assert resp.debug["overall_score"] == resp.hits[0].score
+    # Top-level timings dict carries the whole-search wall clock.
+    timings = resp.debug["timings_ms"]
+    assert isinstance(timings, dict)
+    # Float milliseconds (microsecond resolution) — integer ms would
+    # truncate every sub-ms step to 0 and make the trace useless on the
+    # fast paths (vec0 KNN, cached-model embed, empty-result FTS).
+    assert isinstance(timings["total_ms"], float)
+    assert timings["total_ms"] >= 0
+
+
+def test_trace_overall_score_is_zero_when_no_hits(conn) -> None:
+    """Empty result list → ``overall_score == 0.0``. Anchors the lower
+    bound so the value is always interpretable."""
+    _seed_corpus(conn)
+    resp = search_service.search(conn, "nonexistent_term_xyz", mode="keyword")
+    assert resp.hits == []
+    assert resp.debug is not None
+    assert resp.debug["overall_score"] == 0.0
+
+
+def test_trace_overall_score_for_empty_query_is_zero(conn, monkeypatch) -> None:
+    """Whitespace-only query short-circuits the whole search but still
+    populates a complete trace (overall_score=0, total_ms>=0) so the
+    frontend can render the empty state without special-casing."""
+    _patch_debug(monkeypatch, enabled=True)
+    _seed_corpus(conn)
+    resp = search_service.search(conn, "   ", mode="hybrid")
+    assert resp.hits == []
+    assert resp.debug is not None
+    assert resp.debug["overall_score"] == 0.0
+    assert resp.debug["timings_ms"]["total_ms"] >= 0
+
+
+def test_keyword_leg_trace_records_db_search_timing_and_overall_score(conn) -> None:
+    """The keyword leg has no LLM / embedding step, so its ``timings_ms``
+    must contain ``db_search_ms`` + ``total_ms`` but NOT
+    ``llm_preprocess_ms`` or ``embedding_ms``. ``overall_score`` matches
+    the top hit's score within this leg."""
+    _seed_corpus(conn)
+    resp = search_service.search(conn, "alpha", mode="keyword")
+    assert resp.debug is not None
+    kw = resp.debug["legs"]["keyword"]
+    timings = kw["timings_ms"]
+    assert set(timings.keys()) == {"db_search_ms", "total_ms"}
+    assert isinstance(timings["db_search_ms"], float) and timings["db_search_ms"] >= 0
+    assert isinstance(timings["total_ms"], float) and timings["total_ms"] >= 0
+    # db_search_ms is a strict subset of total_ms. Allow microsecond
+    # rounding slack from the two separate ``round(..., 3)`` calls.
+    assert timings["db_search_ms"] <= timings["total_ms"] + 0.001
+    # overall_score equals the top keyword hit score.
+    assert resp.hits
+    assert kw["overall_score"] == max(h.score for h in resp.hits)
+
+
+def test_semantic_fts_leg_trace_records_llm_and_db_timings(conn, monkeypatch) -> None:
+    """The semantic_fts leg runs ``distill_query`` (LLM preprocess) then
+    ``search_fts`` (DB). Its ``timings_ms`` must contain
+    ``llm_preprocess_ms`` + ``db_search_ms`` + ``total_ms`` (no
+    ``embedding_ms`` — embedding only lives in the KNN leg)."""
+    monkeypatch.setattr(search_service, "distill_query", lambda _q: "alpha")
+    _seed_corpus(conn)
+    resp = search_service.search(conn, "anything", mode="semantic")
+    assert resp.debug is not None
+    fts = resp.debug["legs"]["semantic_fts"]
+    timings = fts["timings_ms"]
+    assert set(timings.keys()) == {"llm_preprocess_ms", "db_search_ms", "total_ms"}
+    for k, v in timings.items():
+        assert isinstance(v, float) and v >= 0, f"{k} not a non-negative float: {v!r}"
+    # llm_preprocess_ms + db_search_ms are subsets of total_ms. Allow
+    # microsecond rounding slack across the three ``round(..., 3)`` calls.
+    assert (
+        timings["llm_preprocess_ms"] + timings["db_search_ms"]
+        <= timings["total_ms"] + 0.002
+    )
+    assert "overall_score" in fts
+
+
+def test_semantic_knn_leg_trace_records_all_three_step_timings(conn, monkeypatch) -> None:
+    """The semantic_knn leg runs all three instrumented steps:
+    ``augment_query`` (LLM), ``embed_query`` (embedding), ``search_vec``
+    (DB). Its ``timings_ms`` must carry all three sub-step keys plus
+    ``total_ms``."""
+    monkeypatch.setattr(search_service, "augment_query", lambda _q: "alpha rollout")
+    _seed_corpus(conn)
+    resp = search_service.search(conn, "anything", mode="semantic")
+    assert resp.debug is not None
+    knn = resp.debug["legs"]["semantic_knn"]
+    timings = knn["timings_ms"]
+    assert set(timings.keys()) == {
+        "llm_preprocess_ms", "embedding_ms", "db_search_ms", "total_ms",
+    }
+    for k, v in timings.items():
+        assert isinstance(v, float) and v >= 0, f"{k} not a non-negative float: {v!r}"
+    # Sub-step times sum to no more than the total (with a small
+    # rounding slack — each value goes through ``round(..., 3)``).
+    sub_total = (
+        timings["llm_preprocess_ms"]
+        + timings["embedding_ms"]
+        + timings["db_search_ms"]
+    )
+    assert sub_total <= timings["total_ms"] + 0.003
+
+
+def test_leg_trace_overall_score_zero_when_leg_has_no_hits(conn) -> None:
+    """Each leg's ``overall_score`` is 0.0 when that leg returned no
+    hits. We use a query that matches nothing in the seeded corpus."""
+    _seed_corpus(conn)
+    resp = search_service.search(conn, "nonexistent_term_xyz", mode="hybrid")
+    assert resp.debug is not None
+    for src, leg_trace in resp.debug["legs"].items():
+        # Different legs may surface different hit counts on a no-match
+        # query — the contract is just "0.0 when no hits".
+        if not leg_trace.get("fts_hits") and not leg_trace.get("final_scores"):
+            assert leg_trace["overall_score"] == 0.0, (
+                f"leg {src} returned no hits but overall_score != 0: "
+                f"{leg_trace['overall_score']!r}"
+            )
+
+
+def test_leg_trace_overall_score_for_short_circuit_path(conn, monkeypatch) -> None:
+    """The keyword leg short-circuits before the DB call when every
+    query token is sub-trigram (``Q3 工会``). The trace must still
+    populate ``timings_ms.total_ms`` + ``overall_score=0.0`` so the
+    contract holds on every return path. Only ``total_ms`` is in
+    ``timings_ms`` (no db_search_ms because the DB call never ran)."""
+    _seed_corpus(conn)
+    resp = search_service.search(conn, "Q3 工会", mode="keyword")
+    assert resp.hits == []
+    assert resp.debug is not None
+    kw = resp.debug["legs"]["keyword"]
+    assert kw["overall_score"] == 0.0
+    assert set(kw["timings_ms"].keys()) == {"total_ms"}
+
+
+def test_top_level_overall_score_equals_max_across_legs(conn, monkeypatch) -> None:
+    """The top-level ``overall_score`` equals the max of every leg's
+    ``overall_score`` — this is the contract the streaming endpoint
+    relies on (it computes the same value incrementally from raw leg
+    hits without re-doing the per-email merge)."""
+    # distill / augment fall back to raw — both LLM legs embed/search "alpha".
+    _seed_corpus(conn)
+    resp = search_service.search(conn, "alpha", mode="hybrid")
+    assert resp.debug is not None
+    per_leg_max = max(
+        leg["overall_score"] for leg in resp.debug["legs"].values()
+    )
+    assert resp.debug["overall_score"] == per_leg_max
+
+
+def test_debug_disabled_omits_overall_score_and_timings(conn, monkeypatch) -> None:
+    """When ``debug_enabled=False`` the whole trace dict is ``None`` —
+    overall_score / timings_ms are NOT smuggled in via some other field.
+    Keeps the lean path lean."""
+    _patch_debug(monkeypatch, enabled=False)
+    _seed_corpus(conn)
+    resp = search_service.search(conn, "alpha", mode="hybrid")
+    assert resp.debug is None
+
+
+def test_search_stream_done_includes_overall_score(tmp_path, monkeypatch) -> None:
+    """The streaming endpoint's ``done`` event carries the overall_score
+    next to the existing ``duration_ms`` so the browser can render a
+    single quality summary without re-walking every hit."""
+    from fastapi.testclient import TestClient
+
+    from emailsearch.config import Settings
+    from emailsearch.web.app import create_app
+
+    db_path = tmp_path / "stream-overall.db"
+    s = Settings(db_path=db_path, debug_enabled=True)
+    monkeypatch.setattr("emailsearch.web.routes.search.get_settings", lambda: s)
+    monkeypatch.setattr(search_service, "get_settings", lambda: s)
+    monkeypatch.setattr(search_service, "distill_query", lambda _q: None)
+    monkeypatch.setattr(search_service, "augment_query", lambda _q: None)
+    monkeypatch.setattr(
+        search_service, "embed_query",
+        lambda text: _seed_vec(0.01 if text.strip().lower() == "alpha" else 0.5),
+    )
+
+    conn = open_connection(db_path)
+    apply_schema(conn)
+    try:
+        insert_email_with_chunks(
+            conn,
+            _email("stream-2", "alpha rollout", "we shipped alpha last week"),
+            [_chunk("stream-2", 0, "we shipped alpha last week", seed=0.01)],
+        )
+    finally:
+        conn.close()
+
+    app = create_app()
+    with TestClient(app) as client:
+        resp = client.get("/api/search/stream?q=alpha&mode=hybrid&limit=5")
+        events = _parse_ndjson(resp.text)
+
+    done = next(e for e in events if e["type"] == "done")
+    assert "overall_score" in done
+    assert isinstance(done["overall_score"], (int, float))
+    # At least one leg surfaced the seeded email, so the overall score
+    # is strictly positive.
+    assert done["overall_score"] > 0.0
+    # And it matches the highest score across every emitted hit.
+    hit_events = [e for e in events if e["type"] == "hits"]
+    all_scores = [h["score"] for he in hit_events for h in he["hits"]]
+    assert done["overall_score"] == max(all_scores)
+
+
+def test_search_stream_done_overall_score_zero_for_empty_query(
+    tmp_path, monkeypatch,
+) -> None:
+    """An empty query produces a ``done`` event with
+    ``overall_score == 0.0`` (and ``duration_ms == 0``). The done
+    contract is consistent regardless of whether any legs ran."""
+    from fastapi.testclient import TestClient
+
+    from emailsearch.config import Settings
+    from emailsearch.web.app import create_app
+
+    db_path = tmp_path / "stream-empty-score.db"
+    s = Settings(db_path=db_path, debug_enabled=True)
+    monkeypatch.setattr("emailsearch.web.routes.search.get_settings", lambda: s)
+    monkeypatch.setattr(search_service, "get_settings", lambda: s)
+    conn = open_connection(db_path)
+    apply_schema(conn)
+    conn.close()
+
+    app = create_app()
+    with TestClient(app) as client:
+        resp = client.get("/api/search/stream?q=%20%20&mode=hybrid")
+        events = _parse_ndjson(resp.text)
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["duration_ms"] == 0
+    assert done["overall_score"] == 0.0
 
 
 # ---------------------------------------------------------------------------

@@ -72,6 +72,12 @@ export interface SearchStreamError {
 export interface SearchStreamDone {
   type: 'done';
   duration_ms: number;
+  /** Max hit score across every leg of this search. Higher = stronger
+   *  top match. KNN summary-promoted hits land in `[1, 2]` while FTS
+   *  hits stay in `(0, 1]`, so an `overall_score > 1` means the top
+   *  result was a topical (summary) match. `0` when the search produced
+   *  no hits. */
+  overall_score: number;
 }
 
 export type SearchStreamEvent =

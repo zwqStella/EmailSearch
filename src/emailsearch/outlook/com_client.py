@@ -199,6 +199,39 @@ class OutlookClient:
             log.warning("trigger_send_receive failed: %s", exc)
             return False, f"failed: {exc}"
 
+    def display_email(self, entry_id: str) -> tuple[bool, str]:
+        """Open an Outlook item by EntryID in the normal Outlook inspector.
+
+        Replaces the broken ``outlook:<EntryID>`` URL scheme — which is
+        not a registered Windows protocol handler and fails with "scheme
+        does not have a registered handler" when launched from a browser.
+        Routing through COM is the only reliable way to jump to a
+        specific item by EntryID on Classic Outlook.
+
+        ``Display()`` is non-blocking — the inspector window pops up
+        asynchronously while this call returns. The Outlook window may
+        appear behind the browser; the user clicks the taskbar to bring
+        it forward (we deliberately don't ``Activate()`` it because that
+        can steal focus during long-running flows like a Load job).
+        """
+        if not entry_id:
+            return False, "missing EntryID"
+        try:
+            assert self._ns is not None
+            item = self._ns.GetItemFromID(entry_id)
+        except Exception as exc:
+            # Most common cause: the message moved folders since indexing,
+            # which invalidates the EntryID. We surface this verbatim so
+            # the user knows to re-load.
+            log.warning("GetItemFromID(%r) failed: %s", entry_id, exc)
+            return False, f"could not find message in Outlook: {exc}"
+        try:
+            item.Display()
+        except Exception as exc:
+            log.warning("Display() failed for EntryID %r: %s", entry_id, exc)
+            return False, f"failed to open: {exc}"
+        return True, "opened in Outlook"
+
     # ---------- folder discovery ----------
 
     def list_folders(self) -> list[FolderInfo]:

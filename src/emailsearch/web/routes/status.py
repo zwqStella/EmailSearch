@@ -5,12 +5,23 @@ from __future__ import annotations
 import logging
 import sys
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+from emailsearch.config import get_settings
+from emailsearch.db.connection import connect
+from emailsearch.db.repositories import get_email
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["status"])
+
+
+# Custom URL scheme stored in ``EmailRow.web_link`` for COM-loaded
+# messages. The scheme is NOT registered with Windows (browsers report
+# "scheme does not have a registered handler"), so we strip the prefix
+# and drive Outlook directly via COM through :func:`open_email_in_outlook`.
+_COM_LINK_PREFIX = "outlook:"
 
 
 class OutlookStatus(BaseModel):
@@ -78,3 +89,54 @@ def outlook_sync() -> SyncResponse:
     except Exception as exc:
         log.exception("outlook sync trigger failed")
         return SyncResponse(ok=False, detail=f"failed: {exc}")
+
+
+class OpenEmailResponse(BaseModel):
+    ok: bool
+    detail: str
+
+
+@router.post("/outlook/open/{email_id}", response_model=OpenEmailResponse)
+def open_email_in_outlook(email_id: str) -> OpenEmailResponse:
+    """Open an indexed email in the local Outlook app.
+
+    Resolves the email's stored EntryID (kept in ``EmailRow.web_link``
+    under the ``outlook:<EntryID>`` prefix by the COM loader) and asks
+    Outlook to display it. Replaces the broken ``outlook:<EntryID>`` URL
+    scheme used in the previous version — that scheme is NOT registered
+    with Windows and fails browser-side with "scheme does not have a
+    registered handler".
+
+    The 404 path covers both "no such email" and "indexed via a non-COM
+    backend (no EntryID)" — neither is recoverable from the UI, so the
+    frontend just surfaces the detail string verbatim.
+    """
+    with connect(get_settings().resolved_db_path) as conn:
+        email = get_email(conn, email_id)
+    if email is None:
+        raise HTTPException(status_code=404, detail="email not found")
+    link = email.web_link or ""
+    if not link.startswith(_COM_LINK_PREFIX):
+        # Not a COM-loaded message — we can't drive Outlook to it. The
+        # frontend already opens http(s) ``web_link`` URLs directly so
+        # this path only fires for malformed / missing links.
+        raise HTTPException(
+            status_code=404,
+            detail="no Outlook EntryID stored for this email",
+        )
+    entry_id = link[len(_COM_LINK_PREFIX):]
+    if sys.platform != "win32":
+        return OpenEmailResponse(ok=False, detail="Outlook COM is Windows-only.")
+    try:
+        from emailsearch.outlook.com_client import OutlookClient, OutlookUnavailableError
+    except Exception as exc:
+        return OpenEmailResponse(ok=False, detail=f"import failed: {exc}")
+    try:
+        with OutlookClient() as client:
+            ok, detail = client.display_email(entry_id)
+        return OpenEmailResponse(ok=ok, detail=detail)
+    except OutlookUnavailableError as exc:
+        return OpenEmailResponse(ok=False, detail=str(exc))
+    except Exception as exc:
+        log.exception("outlook open failed for email_id=%s", email_id)
+        return OpenEmailResponse(ok=False, detail=f"failed: {exc}")

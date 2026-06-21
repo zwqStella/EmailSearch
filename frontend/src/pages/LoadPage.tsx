@@ -2,8 +2,11 @@ import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   cancelJob,
+  clearIndex,
   clearJobHistory,
   getJob,
+  getOutlookStatus,
+  getStats,
   listFolders,
   listJobs,
   startLoad,
@@ -123,9 +126,140 @@ export default function LoadPage() {
     },
   });
 
+  // --- Outlook backend status + index admin (merged from the old
+  // Settings tab — kept here so loading + diagnostics live next to the
+  // workflow that needs them). ---------------------------------------
+  const outlookStatus = useQuery({
+    queryKey: ['outlook-status'],
+    queryFn: getOutlookStatus,
+    // Cheap probe but still opens a COM session, so don't poll on a timer.
+    staleTime: 60_000,
+  });
+  const stats = useQuery({ queryKey: ['stats'], queryFn: getStats });
+
+  const clearIndexMutation = useMutation({
+    mutationFn: clearIndex,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['stats'] });
+      qc.invalidateQueries({ queryKey: ['jobs'] });
+    },
+  });
+
+  const onClearIndex = () => {
+    if (clearIndexMutation.isPending) return;
+    const n = stats.data?.emails ?? 0;
+    const ok = window.confirm(
+      n > 0
+        ? `Delete ${n} indexed email(s) and ${stats.data?.chunks ?? 0} vector chunk(s)?\n\n` +
+          "Your Outlook mailbox is NOT touched — this only clears EmailSearch's local index. " +
+          'You can re-load below.'
+        : 'Reset the index? (No data to delete, but tables will be rebuilt — picks up any schema changes.)',
+    );
+    if (ok) clearIndexMutation.mutate();
+  };
+
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-      <section className="lg:col-span-2 bg-white rounded shadow-sm p-4">
+    <div className="flex flex-col gap-4">
+      {/* Diagnostics row — Outlook backend status + index stats. Kept at
+          the top so the user sees a red "unavailable" badge BEFORE they
+          spend time configuring a date range and clicking Load. */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <section className="bg-white rounded shadow-sm p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-base font-semibold">Outlook backend</h2>
+            <button
+              onClick={() => outlookStatus.refetch()}
+              disabled={outlookStatus.isFetching}
+              className="text-xs px-2 py-1 rounded border bg-white hover:bg-gray-100 disabled:opacity-60"
+            >
+              {outlookStatus.isFetching ? 'Checking…' : 'Refresh'}
+            </button>
+          </div>
+          {outlookStatus.isLoading && (
+            <div className="text-sm text-gray-500">Checking Outlook…</div>
+          )}
+          {outlookStatus.data && (
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <span
+                  className={`text-xs px-2 py-0.5 rounded ${
+                    outlookStatus.data.available
+                      ? 'bg-emerald-100 text-emerald-900'
+                      : 'bg-red-100 text-red-900'
+                  }`}
+                >
+                  {outlookStatus.data.available ? 'connected' : 'unavailable'}
+                </span>
+                <span className="text-sm text-gray-700">
+                  {outlookStatus.data.detail}
+                </span>
+              </div>
+              <div className="text-xs text-gray-600">
+                Backend: <code>{outlookStatus.data.backend}</code>
+              </div>
+            </div>
+          )}
+          {outlookStatus.data && !outlookStatus.data.available && (
+            <div className="mt-3 text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded p-3">
+              Make sure <strong>Classic Outlook</strong> is installed and running
+              on this machine. New Outlook for Windows does not expose COM and
+              won't work here. Outlook auto-launches when this app first asks
+              for messages.
+            </div>
+          )}
+          <p className="text-xs text-gray-500 mt-3">
+            EmailSearch reads mail directly from your local Outlook app via COM
+            automation — no auth tokens, no Conditional Access, no Entra app
+            registration. Whatever Outlook can see, this app can index.
+          </p>
+        </section>
+
+        <section className="bg-white rounded shadow-sm p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-base font-semibold">Index</h2>
+            <button
+              onClick={onClearIndex}
+              disabled={clearIndexMutation.isPending}
+              className="text-xs px-2 py-1 rounded border border-red-200 bg-white text-red-700 hover:bg-red-50 disabled:opacity-60"
+            >
+              {clearIndexMutation.isPending
+                ? 'Clearing…'
+                : 'Clear all indexed emails'}
+            </button>
+          </div>
+          <div className="grid grid-cols-2 gap-3 text-sm">
+            <IndexStat label="Emails" value={stats.data?.emails ?? 0} />
+            <IndexStat label="Vector chunks" value={stats.data?.chunks ?? 0} />
+          </div>
+          {clearIndexMutation.error && (
+            <div className="mt-2 text-xs text-red-700">
+              {(clearIndexMutation.error as Error).message}
+            </div>
+          )}
+          {clearIndexMutation.data && (
+            <div className="mt-2 text-xs text-emerald-700">
+              Cleared {clearIndexMutation.data.deleted.emails} email(s) and{' '}
+              {clearIndexMutation.data.deleted.chunks} chunk(s). Schema rebuilt.
+            </div>
+          )}
+          <p className="text-xs text-gray-600 mt-3">
+            Embedding model:{' '}
+            <code>sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2</code>{' '}
+            (384-dim, multilingual). Database is stored locally under{' '}
+            <code>~/.emailsearch/emails.db</code>.
+          </p>
+          <p className="text-xs text-gray-500 mt-2">
+            Clearing only deletes the local SQLite index — your Outlook
+            mailbox is untouched. Use this after changing the embedding model
+            or FTS tokenizer so the next Load picks up the new schema.
+          </p>
+        </section>
+      </div>
+
+      {/* Primary workflow row — Load form + Recent jobs (was the entire
+          Load page before the Settings merge). */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <section className="lg:col-span-2 bg-white rounded shadow-sm p-4">
         <h2 className="text-base font-semibold mb-3">Load emails from Outlook</h2>
         <div className="grid grid-cols-2 gap-3">
           <label className="text-sm">
@@ -324,6 +458,7 @@ export default function LoadPage() {
           )}
         </ul>
       </section>
+      </div>
     </div>
   );
 }
@@ -332,6 +467,18 @@ function Stat({ label, value }: { label: string; value: number }) {
   return (
     <div>
       <div className="text-xl font-semibold text-gray-900">{value}</div>
+      <div className="text-xs text-gray-600">{label}</div>
+    </div>
+  );
+}
+
+/** Larger stat card used in the Index panel \u2014 visually distinct from
+ *  the slim {@link Stat} cards inside the active-job summary so the two
+ *  diagnostic sections don't visually compete for attention. */
+function IndexStat({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="border rounded p-3 bg-gray-50">
+      <div className="text-2xl font-semibold text-gray-900">{value}</div>
       <div className="text-xs text-gray-600">{label}</div>
     </div>
   );

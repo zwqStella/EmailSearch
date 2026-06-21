@@ -88,6 +88,10 @@ interface SearchStreamState {
   fatalError: string | null;
   /** Total wall-clock for the search, set by the done event. */
   durationMs: number | null;
+  /** Max hit score across every leg, set by the done event. Higher =
+   *  stronger top match; KNN summary-promoted hits land in [1, 2] while
+   *  FTS hits stay in (0, 1]. `null` until done fires. */
+  overallScore: number | null;
 }
 
 const EMPTY_STATE: SearchStreamState = {
@@ -101,6 +105,7 @@ const EMPTY_STATE: SearchStreamState = {
   errors: {},
   fatalError: null,
   durationMs: null,
+  overallScore: null,
 };
 
 export default function SearchPage() {
@@ -229,7 +234,10 @@ export default function SearchPage() {
     console.info(
       `🔎 search: ${JSON.stringify(streamState.query)} (${streamState.mode}) → ` +
         `${hits.length} hit(s) across ${streamState.expectedSources.length} leg(s)` +
-        (streamState.durationMs != null ? ` in ${streamState.durationMs}ms` : ''),
+        (streamState.durationMs != null ? ` in ${streamState.durationMs}ms` : '') +
+        (streamState.overallScore != null
+          ? ` · overall_score=${streamState.overallScore.toFixed(3)}`
+          : ''),
     );
 
     if (streamState.fatalError) {
@@ -561,6 +569,7 @@ function applyStreamEvent(
         ...s,
         inFlight: false,
         durationMs: event.duration_ms,
+        overallScore: event.overall_score,
       }));
       return;
     }

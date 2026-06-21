@@ -138,6 +138,13 @@ async def search_stream_endpoint(
 
     async def _generate() -> AsyncIterator[bytes]:
         started_at = time.perf_counter()
+        # Running max across every leg's hits. Mirrors the sync
+        # wrapper's ``overall_score`` (max of merged hits): since the
+        # frontend's per-email merge rule is also "keep the higher
+        # score", the max across raw leg hits equals the max across the
+        # merged set, so we can compute it incrementally without
+        # buffering.
+        overall_score = 0.0
 
         # Meta first so the browser knows how many legs to expect before
         # any results land.
@@ -153,7 +160,11 @@ async def search_stream_endpoint(
         if not q.strip():
             # Empty query → no legs. Emit done immediately so the browser
             # stops its "Searching..." spinner.
-            yield _ndjson({"type": "done", "duration_ms": 0})
+            yield _ndjson({
+                "type": "done",
+                "duration_ms": 0,
+                "overall_score": 0.0,
+            })
             return
 
         # Kick off every leg in parallel. Each leg is wrapped in a tagged
@@ -188,6 +199,9 @@ async def search_stream_endpoint(
                         "message": f"{type(payload).__name__}: {payload}",
                     })
                     continue
+                for hit in payload.hits:
+                    if hit.score > overall_score:
+                        overall_score = hit.score
                 yield _ndjson({
                     "type": "hits",
                     "source": payload.source,
@@ -202,7 +216,11 @@ async def search_stream_endpoint(
                     t.cancel()
 
         duration_ms = int((time.perf_counter() - started_at) * 1000)
-        yield _ndjson({"type": "done", "duration_ms": duration_ms})
+        yield _ndjson({
+            "type": "done",
+            "duration_ms": duration_ms,
+            "overall_score": overall_score,
+        })
 
     return StreamingResponse(
         _generate(),

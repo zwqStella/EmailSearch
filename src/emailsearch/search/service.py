@@ -23,6 +23,7 @@ import json
 import logging
 import re
 import sqlite3
+import time
 from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel
@@ -241,6 +242,7 @@ def search(
     score. Snippets / ``matched_in`` ride along with that winning hit — we
     don't cross-merge metadata from losing legs.
     """
+    search_started = time.perf_counter()
     query = query.strip()
     filters = filters or SearchFilters()
     settings = get_settings()
@@ -253,6 +255,9 @@ def search(
     )
 
     if not query:
+        if trace is not None:
+            trace["overall_score"] = 0.0
+            trace["timings_ms"] = {"total_ms": _ms_since(search_started)}
         return SearchResponse(hits=[], mode=mode, query="", debug=trace)
 
     log.info(
@@ -276,6 +281,12 @@ def search(
     ranked = sorted(merged.values(), key=lambda h: h.score, reverse=True)[:limit]
     log.info("search: returning %d hit(s) for query=%r", len(ranked), query)
     if trace is not None:
+        # Overall score = best per-email score across all legs after the
+        # merge. Higher = stronger top match. KNN summary-promoted hits
+        # land in [1, 2], FTS hits in (0, 1], so an overall_score > 1
+        # means the top result was a topical (summary) match.
+        trace["overall_score"] = max((h.score for h in ranked), default=0.0)
+        trace["timings_ms"] = {"total_ms": _ms_since(search_started)}
         # Mirror the full structured trace to the server log so it's
         # visible in the uvicorn console without depending on the browser.
         log.info("search trace: %s", json.dumps(trace, default=str, ensure_ascii=False))
@@ -295,7 +306,9 @@ def _run_keyword_leg(
     filters: SearchFilters,
     debug: bool,
 ) -> LegResult:
+    leg_started = time.perf_counter()
     leg_trace: dict[str, Any] | None = {"input": query} if debug else None
+    timings_ms: dict[str, float] = {}
     built = _to_fts_query(query, joiner="AND")
     if leg_trace is not None:
         leg_trace["fts_query"] = built.query
@@ -309,11 +322,13 @@ def _run_keyword_leg(
         )
     if not built.query:
         log.info("keyword: empty fts query after sanitization (raw=%r)", query)
+        _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
         return LegResult(source="keyword", hits=[], trace=leg_trace)
     # Over-fetch so the substring-false-positive filter has headroom; a
     # common fragment like "labor" can otherwise drown legitimate matches
     # out of the top-N.
     fts_limit = max(limit * _FTS_OVERFETCH_FACTOR, 20)
+    db_started = time.perf_counter()
     raw_fts_hits = search_fts(
         conn,
         built.query,
@@ -323,6 +338,7 @@ def _run_keyword_leg(
         from_address=filters.from_address,
         folder_id=filters.folder_id,
     )
+    timings_ms["db_search_ms"] = _ms_since(db_started)
     log.info(
         "keyword: fts raw returned %d hit(s) (over-fetch=%d) for %r",
         len(raw_fts_hits), fts_limit, built.query,
@@ -332,6 +348,7 @@ def _run_keyword_leg(
             leg_trace["fts_raw_count"] = 0
             leg_trace["fts_substring_filtered_count"] = 0
             leg_trace["fts_hits"] = []
+        _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
         return LegResult(source="keyword", hits=[], trace=leg_trace)
 
     # Reject trigram substring false positives ("labor" inside
@@ -370,6 +387,7 @@ def _run_keyword_leg(
             for h in verified
         ]
     if not verified:
+        _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
         return LegResult(source="keyword", hits=[], trace=leg_trace)
 
     out: list[SearchHit] = []
@@ -377,8 +395,11 @@ def _run_keyword_leg(
         e = emails.get(h.email_id)
         if e is None:
             continue
-        # Higher score = better. bm25 is "lower better"; invert.
-        score = 1.0 / (1.0 + max(0.0, h.rank))
+        # Higher score = better. bm25 is more-negative-is-better; see
+        # ``_bm25_to_score`` for the conversion (the naive
+        # ``1/(1+max(0, rank))`` clamps every negative rank to 0 and
+        # collapses all hits to a flat score of 1.0).
+        score = _bm25_to_score(h.rank)
         matched_in, matched_att = _classify_keyword_match(e, query)
         out.append(
             SearchHit(
@@ -395,6 +416,7 @@ def _run_keyword_leg(
                 summary=e.summary,
             )
         )
+    _finalize_leg_trace(leg_trace, leg_started, timings_ms, out)
     return LegResult(source="keyword", hits=out, trace=leg_trace)
 
 
@@ -425,7 +447,11 @@ def _run_semantic_fts_leg(
     Falls back to the raw query when ``distill_query`` returns ``None``
     (LLM disabled / unreachable / failed).
     """
+    leg_started = time.perf_counter()
+    timings_ms: dict[str, float] = {}
+    llm_started = time.perf_counter()
     distilled = distill_query(query)
+    timings_ms["llm_preprocess_ms"] = _ms_since(llm_started)
     fts_input = distilled if distilled else query
     log.info(
         "semantic_fts: raw=%r distilled=%r (fallback=%s)",
@@ -453,9 +479,11 @@ def _run_semantic_fts_leg(
             len(built.dropped_short_tokens), built.dropped_short_tokens,
         )
     if not built.query:
+        _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
         return LegResult(source="semantic_fts", hits=[], trace=leg_trace)
 
     fts_limit = max(limit * _FTS_OVERFETCH_FACTOR, 20)
+    db_started = time.perf_counter()
     raw_fts_hits = search_fts(
         conn,
         built.query,
@@ -465,6 +493,7 @@ def _run_semantic_fts_leg(
         from_address=filters.from_address,
         folder_id=filters.folder_id,
     )
+    timings_ms["db_search_ms"] = _ms_since(db_started)
     log.info(
         "semantic_fts: fts raw (distilled=%r -> %r, over-fetch=%d) returned %d hit(s)",
         fts_input, built.query, fts_limit, len(raw_fts_hits),
@@ -474,6 +503,7 @@ def _run_semantic_fts_leg(
             leg_trace["fts_raw_count"] = 0
             leg_trace["fts_substring_filtered_count"] = 0
             leg_trace["fts_hits"] = []
+        _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
         return LegResult(source="semantic_fts", hits=[], trace=leg_trace)
 
     # Reject trigram substring false positives. With OR joiner, a single
@@ -511,6 +541,7 @@ def _run_semantic_fts_leg(
             for h in verified
         ]
     if not verified:
+        _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
         return LegResult(source="semantic_fts", hits=[], trace=leg_trace)
 
     out: list[SearchHit] = []
@@ -518,7 +549,7 @@ def _run_semantic_fts_leg(
         e = emails.get(h.email_id)
         if e is None:
             continue
-        score = 1.0 / (1.0 + max(0.0, h.rank))
+        score = _bm25_to_score(h.rank)
         matched_in, matched_att = _classify_keyword_match(e, fts_input)
         out.append(
             SearchHit(
@@ -535,6 +566,7 @@ def _run_semantic_fts_leg(
                 summary=e.summary,
             )
         )
+    _finalize_leg_trace(leg_trace, leg_started, timings_ms, out)
     return LegResult(source="semantic_fts", hits=out, trace=leg_trace)
 
 
@@ -563,10 +595,14 @@ def _run_semantic_knn_leg(
     legs are unaffected — a verbatim term match remains a strong signal
     even when the embedding similarity isn't.
     """
+    leg_started = time.perf_counter()
+    timings_ms: dict[str, float] = {}
     settings = get_settings()
     threshold = settings.semantic_score_threshold
 
+    llm_started = time.perf_counter()
     augmented = augment_query(query)
+    timings_ms["llm_preprocess_ms"] = _ms_since(llm_started)
     embed_input = augmented if augmented else query
     log.info(
         "semantic_knn: raw=%r augmented=%r (fallback=%s) threshold=%.3f",
@@ -590,8 +626,12 @@ def _run_semantic_knn_leg(
     over = max(limit * 4, 20)
     knn_over = over * 4 if filters.is_active() else over
 
+    embed_started = time.perf_counter()
     qvec = embed_query(embed_input)
+    timings_ms["embedding_ms"] = _ms_since(embed_started)
+    db_started = time.perf_counter()
     chunks = search_vec(conn, qvec, limit=knn_over)
+    timings_ms["db_search_ms"] = _ms_since(db_started)
     log.info(
         "semantic_knn: vec0 returned %d chunk(s) (over=%d)",
         len(chunks), knn_over,
@@ -628,6 +668,7 @@ def _run_semantic_knn_leg(
     if not chunks:
         if leg_trace is not None:
             leg_trace["final_scores"] = []
+        _finalize_leg_trace(leg_trace, leg_started, timings_ms, [])
         return LegResult(source="semantic_knn", hits=[], trace=leg_trace)
 
     # Group chunks by email — track the best body / attachment chunk
@@ -731,12 +772,75 @@ def _run_semantic_knn_leg(
     if leg_trace is not None:
         leg_trace["final_scores"] = [row for _, _, row in ranked]
 
+    _finalize_leg_trace(leg_trace, leg_started, timings_ms, out)
     return LegResult(source="semantic_knn", hits=out, trace=leg_trace)
 
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _ms_since(start: float) -> float:
+    """Milliseconds elapsed since ``start`` (from ``time.perf_counter``),
+    rounded to 3 decimals (microsecond resolution).
+
+    Integer milliseconds truncate every sub-ms step to ``0``, which makes
+    the trace useless for the fast paths (vec0 KNN, cached-model embed,
+    empty-result FTS). Floats keep the signal without flooding the
+    payload with sub-microsecond noise.
+    """
+    return round((time.perf_counter() - start) * 1000, 3)
+
+
+def _finalize_leg_trace(
+    leg_trace: dict[str, Any] | None,
+    leg_started: float,
+    timings_ms: dict[str, float],
+    hits: list[SearchHit],
+) -> None:
+    """Stamp the leg trace with ``total_ms`` + ``overall_score`` just before
+    the leg returns.
+
+    No-op when ``leg_trace`` is ``None`` (debug disabled). Called from
+    every return path in each leg so the trace shape is identical
+    regardless of which early-exit fired.
+
+    - ``timings_ms`` is mutated in place to append ``total_ms``; per-step
+      keys (``llm_preprocess_ms`` / ``embedding_ms`` / ``db_search_ms``)
+      are populated by the leg as those steps complete and remain absent
+      when the leg short-circuits before reaching them. All values are
+      floats with microsecond resolution (see :func:`_ms_since`).
+    - ``overall_score`` is the max hit score returned by this leg, or
+      ``0.0`` when the leg produced no hits. Higher = better; comparable
+      within a leg only (the KNN summary promotion lifts scores into
+      ``[1, 2]`` while FTS legs stay in ``(0, 1)``)."""
+    if leg_trace is None:
+        return
+    timings_ms["total_ms"] = _ms_since(leg_started)
+    leg_trace["timings_ms"] = timings_ms
+    leg_trace["overall_score"] = max((h.score for h in hits), default=0.0)
+
+
+def _bm25_to_score(rank: float) -> float:
+    """Convert a SQLite FTS5 ``bm25()`` rank into a (0, 1) score where
+    higher = better match.
+
+    SQLite's ``bm25(...)`` returns NEGATIVE numbers; the more negative,
+    the stronger the match (the repository sorts ``ORDER BY rank`` —
+    most-negative first — for this exact reason). The naive formula
+    ``1 / (1 + max(0, rank))`` clamps every real negative rank to 0 and
+    collapses ALL hits to a score of exactly ``1.0``, which is why every
+    FTS-only search used to report ``overall_score == 1.000`` regardless
+    of match quality.
+
+    We negate first to get a "goodness" magnitude (larger = stronger),
+    then squash through ``g / (1 + g)`` so the score asymptotes to 1.0
+    for very strong matches and decays toward 0.0 for weak ones. The
+    floor at 0 protects against any spurious non-negative bm25 result
+    (e.g. a degenerate single-token match)."""
+    goodness = max(0.0, -rank)
+    return goodness / (1.0 + goodness)
 
 
 def _preview(s: str | None) -> str:

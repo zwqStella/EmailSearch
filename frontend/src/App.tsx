@@ -1,7 +1,6 @@
 import { Link, NavLink, Route, Routes } from 'react-router-dom';
 import SearchPage from './pages/SearchPage';
 import LoadPage from './pages/LoadPage';
-import SettingsPage from './pages/SettingsPage';
 
 const tabClass = ({ isActive }: { isActive: boolean }) =>
   `px-3 py-2 rounded text-sm font-medium ${
@@ -23,9 +22,6 @@ export default function App() {
             <NavLink to="/load" className={tabClass}>
               Load
             </NavLink>
-            <NavLink to="/settings" className={tabClass}>
-              Settings
-            </NavLink>
           </nav>
         </div>
       </header>
@@ -34,7 +30,9 @@ export default function App() {
           <Routes>
             <Route path="/" element={<SearchPage />} />
             <Route path="/load" element={<LoadPage />} />
-            <Route path="/settings" element={<SettingsPage />} />
+            {/* Legacy /settings route \u2014 the panels were merged into
+                /load. Redirect so any bookmarked links keep working. */}
+            <Route path="/settings" element={<LoadPage />} />
           </Routes>
         </div>
       </main>
