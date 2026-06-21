@@ -12,7 +12,7 @@ export default function App() {
   return (
     <div className="h-full flex flex-col bg-gray-50">
       <header className="border-b bg-white">
-        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center gap-6">
+        <div className="max-w-screen-2xl mx-auto px-6 py-3 flex items-center gap-6">
           <Link to="/" className="text-lg font-semibold text-gray-900">
             EmailSearch
           </Link>
@@ -30,7 +30,7 @@ export default function App() {
         </div>
       </header>
       <main className="flex-1 overflow-auto">
-        <div className="max-w-6xl mx-auto px-4 py-6">
+        <div className="max-w-screen-2xl mx-auto px-6 py-4">
           <Routes>
             <Route path="/" element={<SearchPage />} />
             <Route path="/load" element={<LoadPage />} />

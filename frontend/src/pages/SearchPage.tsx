@@ -10,6 +10,7 @@ import type {
   SearchStreamEvent,
 } from '../api/types';
 import EmailPreview from '../components/EmailPreview';
+import SearchableSelect from '../components/SearchableSelect';
 
 const MODES: SearchMode[] = ['hybrid', 'keyword', 'semantic'];
 
@@ -328,20 +329,20 @@ export default function SearchPage() {
     : '';
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 h-[calc(100vh-8rem)]">
-      <section className="flex flex-col bg-white rounded shadow-sm overflow-hidden">
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-[calc(100vh-7rem)]">
+      <section className="flex flex-col bg-white rounded shadow-sm overflow-hidden lg:col-span-5 xl:col-span-4 min-w-0">
         <div className="p-3 border-b flex gap-2 items-center">
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="Search emails…"
-            className="flex-1 border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="flex-1 min-w-0 border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
             autoFocus
           />
           <select
             value={mode}
             onChange={(e) => setMode(e.target.value as SearchMode)}
-            className="border rounded px-2 py-2 text-sm bg-white"
+            className="border rounded px-2 py-2 text-sm bg-white flex-shrink-0"
             aria-label="Search mode"
           >
             {MODES.map((m) => (
@@ -351,12 +352,14 @@ export default function SearchPage() {
             ))}
           </select>
         </div>
-        {/* Filter bar — hard filters narrow the candidate set BEFORE ranking. */}
-        <div className="px-3 py-2 border-b bg-gray-50 flex flex-wrap gap-2 items-center text-xs">
+        {/* Filter bar — hard filters narrow the candidate set BEFORE ranking.
+            All three dropdowns + the clear link share a single flex row so
+            they don't wrap into ragged stacks in the narrow results column. */}
+        <div className="px-3 py-2 border-b bg-gray-50 flex flex-nowrap gap-2 items-center text-xs">
           <select
             value={datePresetIdx}
             onChange={(e) => setDatePresetIdx(Number(e.target.value))}
-            className="border rounded px-2 py-1 bg-white"
+            className="border rounded px-2 py-1 bg-white min-w-0 flex-shrink"
             aria-label="Date filter"
           >
             {DATE_PRESETS.map((p, i) => (
@@ -365,23 +368,24 @@ export default function SearchPage() {
               </option>
             ))}
           </select>
-          <select
+          <SearchableSelect
             value={senderFilter}
-            onChange={(e) => setSenderFilter(e.target.value)}
-            className="border rounded px-2 py-1 bg-white max-w-[16rem]"
-            aria-label="Sender filter"
-          >
-            <option value="">All senders</option>
-            {facets.data?.senders.map((s) => (
-              <option key={s.address} value={s.address}>
-                {(s.name ? `${s.name} ` : '') + `<${s.address}>`} · {s.count}
-              </option>
-            ))}
-          </select>
+            onChange={setSenderFilter}
+            options={(facets.data?.senders ?? []).map((s) => ({
+              value: s.address,
+              label: s.name ?? s.address,
+              detail: s.name ? `<${s.address}>` : undefined,
+              meta: String(s.count),
+            }))}
+            allLabel="All senders"
+            ariaLabel="Sender filter"
+            searchPlaceholder="Filter senders…"
+            className="min-w-0 flex-1"
+          />
           <select
             value={folderFilter}
             onChange={(e) => setFolderFilter(e.target.value)}
-            className="border rounded px-2 py-1 bg-white max-w-[16rem]"
+            className="border rounded px-2 py-1 bg-white min-w-0 flex-1 truncate"
             aria-label="Folder filter"
           >
             <option value="">All folders</option>
@@ -395,9 +399,9 @@ export default function SearchPage() {
             <button
               type="button"
               onClick={clearFilters}
-              className="ml-auto text-blue-700 underline"
+              className="text-blue-700 underline whitespace-nowrap flex-shrink-0"
             >
-              Clear filters
+              Clear
             </button>
           )}
         </div>
@@ -465,7 +469,7 @@ export default function SearchPage() {
         </div>
       </section>
 
-      <section className="bg-white rounded shadow-sm overflow-hidden">
+      <section className="bg-white rounded shadow-sm overflow-hidden lg:col-span-7 xl:col-span-8 min-w-0">
         {!selectedId && (
           <div className="p-6 text-sm text-gray-500">Select a result to preview.</div>
         )}
