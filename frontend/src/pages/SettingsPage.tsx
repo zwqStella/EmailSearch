@@ -6,9 +6,7 @@ export default function SettingsPage() {
   const status = useQuery({
     queryKey: ['outlook-status'],
     queryFn: getOutlookStatus,
-    // Probe once on mount; user can click Refresh if they want a re-check.
-    // The probe is cheap (no folder walk) but still opens a COM session,
-    // so we don't poll on a timer.
+    // Cheap probe but still opens a COM session, so don't poll on a timer.
     staleTime: 60_000,
   });
   const stats = useQuery({ queryKey: ['stats'], queryFn: getStats });

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS emails (
     conversation_id TEXT,
     body_text       TEXT,                -- plain text; inline-image OCR spliced in
     body_html       TEXT,                -- preserved verbatim for preview iframe
+    summary         TEXT,                -- optional LLM-generated 1-3 sentence summary (NULL when disabled or generation failed); included in searchable_text so FTS picks it up
     web_link        TEXT,                -- Graph webLink → "Open in Outlook"
     attachments     TEXT,                -- JSON array of {att_id,name,content_type,size,extracted_text,status}
     searchable_text TEXT,                -- body_text + " " + concat(attachments[*].extracted_text)
@@ -35,9 +36,8 @@ CREATE INDEX IF NOT EXISTS emails_folder_idx       ON emails(folder_id);
 -- 2) FTS5 keyword index. content='emails' makes it contentless (no double storage);
 --    we sync via triggers below.
 --    tokenize='trigram' (overlapping 3-character shingles) handles CJK correctly:
---    Chinese/Japanese/Korean has no whitespace, so a query like "个税" only matches
---    when each trigram appears as a substring in indexed text. Works fine for
---    English too; the only cost is that bm25 ranking is approximate for ASCII.
+--    Chinese/Japanese/Korean has no whitespace, so substring matching is what we need.
+--    Works fine for English too; bm25 ranking is approximate for ASCII as a trade-off.
 CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(
     subject,
     from_address,
@@ -72,7 +72,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_email_chunks USING vec0(
     chunk_id      TEXT PRIMARY KEY,
     embedding     float[384],
     +email_id     TEXT,
-    +source_type  TEXT,                 -- 'body' | 'attachment'
+    +source_type  TEXT,                 -- 'body' | 'attachment' | 'summary'
     +source_name  TEXT,                 -- attachment filename when source_type='attachment'
     +chunk_index  INTEGER,
     +chunk_text   TEXT

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -21,8 +22,8 @@ log = logging.getLogger(__name__)
 def _frontend_dist_dir() -> Path | None:
     """Resolve the built frontend dir, if present.
 
-    In dev the React app runs on :5173 (proxied to us). In prod we run
-    `npm run build` and FastAPI serves the static files directly.
+    In dev the React app runs on :5173 (proxied to us); in prod we run
+    ``npm run build`` and FastAPI serves the static files directly.
     """
     here = Path(__file__).resolve().parent
     candidate = here.parent.parent.parent / "frontend" / "dist"
@@ -31,16 +32,30 @@ def _frontend_dist_dir() -> Path | None:
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Server lifecycle hooks. On shutdown we signal cooperative cancel to
-    every in-flight sync job and return **immediately** — we do NOT wait for
-    the worker threads.
+    """Server lifecycle hooks.
 
-    Workers are daemon threads (see `sync.loader.spawn_load_job`), so the
-    process exit kills them instantly. Waiting here was the old bug: an
-    Outlook COM `Restrict()` call can block for tens of seconds, during
-    which the worker can't check its cancel flag, and the user thinks
-    Ctrl+C is broken.
+    Startup: eagerly load the HuggingFace embedding model so the first
+    user-facing search doesn't pay the multi-second model-load latency.
+    Dispatched to a worker thread (sentence-transformers does blocking
+    disk + tensor I/O) but awaited so FastAPI delays accepting requests
+    until the model is ready. A preload failure is logged but not fatal
+    — the lazy code path in ``encoder._get_embed_model`` is the safety
+    net.
+
+    Shutdown: signal cooperative cancel to every in-flight sync job and
+    return immediately. Workers are daemon threads (see
+    ``sync.loader.spawn_load_job``) so process exit kills them — we do
+    NOT wait for an Outlook COM ``Restrict()`` call to return.
     """
+    from emailsearch.embed.encoder import preload_models
+
+    try:
+        await asyncio.to_thread(preload_models)
+    except Exception:
+        log.exception(
+            "startup: embedding preload failed; will lazy-load on first use"
+        )
+
     yield
     from emailsearch.sync.jobs import get_registry
 
@@ -61,8 +76,7 @@ def create_app() -> FastAPI:
         lifespan=_lifespan,
     )
 
-    # In dev the React frontend runs on :5173 and proxies /api → here. CORS lets the
-    # browser talk to us during npm run dev.
+    # In dev the React frontend runs on :5173 and proxies /api → here.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
@@ -97,7 +111,7 @@ def create_app() -> FastAPI:
         @app.get("/")
         @app.get("/{full_path:path}")
         def spa(full_path: str = "") -> FileResponse:
-            # Don't shadow API routes (FastAPI matches more specific routes first).
+            # FastAPI matches more specific routes first, so API routes win.
             return FileResponse(index_html)
 
     return app

@@ -2,11 +2,13 @@
 
 import type {
   EmailRow,
+  FilterFacets,
   JobState,
   MailFolder,
   OutlookStatus,
+  SearchFilters,
   SearchMode,
-  SearchResponse,
+  SearchStreamEvent,
   Stats,
 } from './types';
 
@@ -46,8 +48,106 @@ export const clearIndex = () =>
   );
 
 // ---------- search ----------
-export const search = (q: string, mode: SearchMode, limit = 20) =>
-  api<SearchResponse>(`/api/search?q=${encodeURIComponent(q)}&mode=${mode}&limit=${limit}`);
+
+/**
+ * Stream per-leg search events from /api/search/stream.
+ *
+ * Each leg (keyword / semantic_fts / semantic_knn) produces a self-scored
+ * hit list with no cross-leg fusion; the caller is responsible for
+ * merging and reranking by score as events arrive. See
+ * `src/pages/SearchPage.tsx` for the merge implementation.
+ *
+ * Cancellation: pass an `AbortSignal` (e.g. from `AbortController`) so
+ * the in-flight search can be aborted when the user changes the query
+ * mid-flight. The server detects the disconnect and cancels any
+ * still-running legs.
+ *
+ * The returned async iterator yields one parsed `SearchStreamEvent` per
+ * NDJSON line. It terminates when the server closes the stream (after
+ * the `done` event) OR when `signal` is aborted (the iterator will
+ * raise the abort reason on the next iteration).
+ */
+export async function* searchStream(
+  q: string,
+  mode: SearchMode,
+  limit = 20,
+  filters?: SearchFilters,
+  signal?: AbortSignal,
+): AsyncGenerator<SearchStreamEvent> {
+  // Only emit params that are actually set — the backend treats omitted
+  // params as "no filter on this dimension".
+  const params = new URLSearchParams({ q, mode, limit: String(limit) });
+  if (filters?.start_at != null) params.set('start_at', String(filters.start_at));
+  if (filters?.end_at != null) params.set('end_at', String(filters.end_at));
+  if (filters?.from_address) params.set('from_address', filters.from_address);
+  if (filters?.folder_id) params.set('folder_id', filters.folder_id);
+
+  const res = await fetch(`/api/search/stream?${params.toString()}`, {
+    headers: { Accept: 'application/x-ndjson' },
+    signal,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  if (!res.body) {
+    throw new Error('search stream returned no body');
+  }
+
+  // Parse NDJSON incrementally: buffer bytes, split on '\n', JSON.parse
+  // each complete line. Anything left in the buffer at end-of-stream is
+  // a final partial line (shouldn't happen with a well-behaved server,
+  // but we still flush it).
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // Process every complete line currently in the buffer.
+      let newlineIdx = buffer.indexOf('\n');
+      while (newlineIdx !== -1) {
+        const line = buffer.slice(0, newlineIdx).trim();
+        buffer = buffer.slice(newlineIdx + 1);
+        if (line) {
+          try {
+            yield JSON.parse(line) as SearchStreamEvent;
+          } catch (err) {
+            // A malformed JSON line is non-fatal — log + skip so one bad
+            // line doesn't kill the whole stream.
+            // eslint-disable-next-line no-console
+            console.error('searchStream: failed to parse NDJSON line', line, err);
+          }
+        }
+        newlineIdx = buffer.indexOf('\n');
+      }
+    }
+    // Flush any trailing partial line.
+    const tail = buffer.trim();
+    if (tail) {
+      try {
+        yield JSON.parse(tail) as SearchStreamEvent;
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('searchStream: failed to parse trailing NDJSON line', tail, err);
+      }
+    }
+  } finally {
+    // Release the reader lock so the body can be garbage-collected. If
+    // we got here via an AbortError, `cancel()` is a no-op on an
+    // already-aborted stream.
+    try {
+      await reader.cancel();
+    } catch {
+      // Ignore — the reader may already be closed.
+    }
+  }
+}
+
+export const getFilterFacets = () => api<FilterFacets>('/api/filters');
 
 export const getEmail = (id: string) => api<EmailRow>(`/api/emails/${encodeURIComponent(id)}`);
 export const getStats = () => api<Stats>('/api/stats');

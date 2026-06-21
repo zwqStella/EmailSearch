@@ -42,8 +42,7 @@ async def start_load(req: LoadRequest) -> LoadResponse:
         end_at=end_at,
         folder_ids=req.folder_ids,
     )
-    # Daemon thread → process exit kills the worker instantly on Ctrl+C,
-    # no waiting for an in-flight Outlook COM call to return.
+    # Daemon thread — process exit kills the worker instantly on Ctrl+C.
     spawn_load_job(job.job_id)
     return LoadResponse(job_id=job.job_id)
 

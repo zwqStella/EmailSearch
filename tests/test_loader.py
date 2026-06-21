@@ -91,12 +91,21 @@ def stub_embed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture()
 def isolated_settings(tmp_path, monkeypatch: pytest.MonkeyPatch) -> Settings:
-    """Use a tmp DB so each test has a clean slate, and disable real OCR."""
+    """Use a tmp DB so each test has a clean slate, and disable real OCR /
+    LLM so the loader stays offline.
+
+    `llm_enabled=False` here mirrors what loader tests have always assumed
+    — no local model server is required. The autouse OCR / LLM stubs above
+    handle the rest. We ALSO stub the loader's `summarize_email` reference
+    directly so that even if a future commit forgets to thread settings
+    through, this test won't hit the network.
+    """
     s = Settings(
         data_dir=tmp_path,
         db_path=tmp_path / "test.db",
         ocr_enabled=False,
         max_attachment_mb=25,
+        llm_enabled=False,
     )
     s.ensure_dirs()
     monkeypatch.setattr("emailsearch.config.get_settings", lambda: s)
@@ -104,6 +113,9 @@ def isolated_settings(tmp_path, monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.setattr("emailsearch.sync.jobs.get_settings", lambda: s)
     monkeypatch.setattr("emailsearch.extract.inline_images.get_settings", lambda: s)
     monkeypatch.setattr("emailsearch.extract.extractors.get_settings", lambda: s)
+    # Belt-and-braces: stub summarize_email itself so it never touches HTTP
+    # even if the settings injection above gets bypassed somehow.
+    monkeypatch.setattr("emailsearch.sync.loader.summarize_email", lambda _e: None)
     return s
 
 
@@ -365,12 +377,17 @@ async def test_request_cancel_all_active(isolated_settings: Settings) -> None:
 
 async def test_lifespan_shutdown_cancels_active_jobs(
     isolated_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Server lifespan shutdown should signal cancel + mark stuck jobs
     cancelled-on-disk via the eventual rehydration reconciler."""
     from fastapi import FastAPI
 
     from emailsearch.web.app import _lifespan
+
+    # The lifespan startup eagerly loads the HuggingFace embedding model;
+    # stub it out so this unit test doesn't touch ~/.cache/huggingface.
+    monkeypatch.setattr("emailsearch.embed.encoder.preload_models", lambda: None)
 
     reg = JobRegistry()
     job = reg.create(start_at=0, end_at=1, folder_ids=None)
@@ -389,3 +406,55 @@ async def test_lifespan_shutdown_cancels_active_jobs(
 
     # The job's cancel flag should have been set during shutdown.
     assert reg.get(job.job_id).is_cancel_requested()
+
+
+async def test_lifespan_startup_preloads_embedding_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Server lifespan startup must call ``preload_models`` BEFORE yielding
+    so the first user search doesn't pay the HuggingFace load latency.
+
+    We assert the call happens before the yield (i.e. while ``async with``
+    is still entering) — that's the exact ordering FastAPI relies on to
+    delay request acceptance until startup is complete.
+    """
+    from fastapi import FastAPI
+
+    from emailsearch.web.app import _lifespan
+
+    preload_calls: list[int] = []
+
+    def fake_preload() -> None:
+        preload_calls.append(1)
+
+    monkeypatch.setattr("emailsearch.embed.encoder.preload_models", fake_preload)
+
+    async with _lifespan(FastAPI()):
+        # By the time we're inside the context, startup has completed,
+        # which means preload_models must have been awaited already.
+        assert preload_calls == [1], (
+            f"expected preload_models to be called exactly once during startup, "
+            f"got {len(preload_calls)} call(s)"
+        )
+
+
+async def test_lifespan_startup_preload_failure_is_non_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``preload_models`` raises (e.g. HuggingFace Hub unreachable on a
+    fresh install), startup must still complete — the lazy code path in
+    ``encoder._get_embed_model`` is the safety net, and bringing down the
+    whole server just because a preload failed would be a worse outcome
+    than the original lazy-load behavior we're trying to improve on."""
+    from fastapi import FastAPI
+
+    from emailsearch.web.app import _lifespan
+
+    def boom() -> None:
+        raise RuntimeError("simulated preload failure")
+
+    monkeypatch.setattr("emailsearch.embed.encoder.preload_models", boom)
+
+    # The async-with itself must not raise — the lifespan swallows + logs.
+    async with _lifespan(FastAPI()):
+        pass

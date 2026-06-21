@@ -1,20 +1,17 @@
 """Persistent job registry for the Load button.
 
-Background:
-    Sync jobs used to live in an in-memory dict — restart-on-clear was fine
-    for a single-user local tool. We now persist them to the `sync_jobs`
-    SQLite table so:
+State is mirrored to the ``sync_jobs`` SQLite table so:
 
-      1. The Recent jobs list survives a server restart.
-      2. The user can ask to cancel a still-running job (cooperative — the
-         loader checks `is_cancel_requested()` between messages).
-      3. The user can wipe the entire history with one click.
+  1. The Recent jobs list survives a server restart.
+  2. A still-running job can be cooperatively cancelled (the loader
+     checks ``is_cancel_requested()`` between messages).
+  3. The user can wipe the entire history with one click.
 
-    In-memory state remains the source of truth for the *running* job's
-    counters (low-latency mid-job updates) and the cancel flag (set by HTTP,
-    read by worker thread). On every update we mirror to SQLite. On startup
-    we load the most recent N jobs from SQLite into memory and force-cancel
-    anything that looked "running" at shutdown.
+In-memory state remains the source of truth for the running job's
+counters (low-latency mid-job updates) and the cancel flag (set by HTTP,
+read by worker thread). On every update we mirror to SQLite. On startup
+we load the most recent N jobs from SQLite into memory and force-cancel
+anything that looked "running" at shutdown.
 """
 
 from __future__ import annotations

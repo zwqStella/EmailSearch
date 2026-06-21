@@ -180,12 +180,11 @@ class OutlookClient:
     def trigger_send_receive(self) -> tuple[bool, str]:
         """Kick off Outlook's Send/Receive on all accounts.
 
-        Returns `(ok, message)`. This is *fire-and-forget* — Outlook handles
-        the sync in the background. It only refreshes items within the
-        account's Cached Exchange Mode window; older items that are not in the
-        local OST cache will NOT be pulled by this call. To get truly old
-        emails the user must widen the "Mail to keep offline" slider in
-        File → Account Settings → (their account) → Change.
+        Fire-and-forget — Outlook handles the sync in the background. Only
+        refreshes items within the account's Cached Exchange Mode window;
+        older items not in the local OST cache will NOT be pulled. To get
+        truly old emails the user must widen the "Mail to keep offline"
+        slider in File → Account Settings.
         """
         try:
             assert self._ns is not None
@@ -205,8 +204,8 @@ class OutlookClient:
     def list_folders(self) -> list[FolderInfo]:
         """Walk every mail-typed folder across every mounted store.
 
-        We skip non-mail folders (Calendar, Contacts, Tasks, Notes, Journal)
-        by checking `DefaultItemType == 0` (olMailItem).
+        Skips non-mail folders (Calendar, Contacts, Tasks, Notes, Journal)
+        by checking ``DefaultItemType == 0`` (olMailItem).
         """
         assert self._ns is not None
         out: list[FolderInfo] = []
@@ -290,10 +289,10 @@ class OutlookClient:
             try:
                 items = folder.Items
                 items.Sort("[ReceivedTime]", True)  # newest first
-                # DASL on `urn:schemas:httpmail:datereceived` is the most
-                # robust filter across Outlook builds. Outlook stores the
-                # property as UTC but applies the comparison in the user's
-                # locale; for hourly granularity that's accurate enough.
+                # DASL on ``urn:schemas:httpmail:datereceived`` is the most
+                # robust filter across Outlook builds. The property is
+                # stored UTC but Outlook compares in the user's locale; for
+                # hourly granularity that's accurate enough.
                 restrict = (
                     f"@SQL=\"urn:schemas:httpmail:datereceived\" >= '{_to_dasl(start_utc)}' AND "
                     f"\"urn:schemas:httpmail:datereceived\" < '{_to_dasl(end_utc)}'"
@@ -303,8 +302,6 @@ class OutlookClient:
                 log.warning("could not restrict folder %s: %s — falling back to scan", folder, exc)
                 filtered = folder.Items
 
-            # COM iteration: the for-loop produces the same proxy each time;
-            # holding `item` as a local keeps it alive for our property reads.
             try:
                 count = int(filtered.Count)
             except Exception:
@@ -327,8 +324,8 @@ class OutlookClient:
                     continue
                 if raw is None:
                     continue
-                # Defensive: in case Restrict semantics drift across Outlook
-                # builds (some return items at the boundary), enforce window.
+                # Defensive: some Outlook builds return items at the boundary;
+                # enforce the window explicitly.
                 if not (start_utc.timestamp() <= raw.received_at < end_utc.timestamp()):
                     continue
                 yield raw
@@ -570,10 +567,9 @@ _CONTENT_TYPE_BY_EXT: dict[str, str] = {
 def _to_dasl(dt: datetime) -> str:
     """Outlook DASL date literal: 'YYYY-MM-DD HH:MM' in local time.
 
-    The `urn:schemas:httpmail:datereceived` property is stored UTC but Outlook
-    converts to local for the comparison. We pass UTC components and rely on
-    Outlook converting consistently — close-enough for our hourly granularity
-    of "all messages in [start,end)".
+    The ``urn:schemas:httpmail:datereceived`` property is stored UTC but
+    Outlook converts to local for the comparison. Hourly granularity is
+    accurate enough for our "all messages in [start,end)" use case.
     """
     return dt.strftime("%Y-%m-%d %H:%M")
 

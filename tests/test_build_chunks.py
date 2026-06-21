@@ -43,22 +43,27 @@ def stub_encoder(monkeypatch: pytest.MonkeyPatch) -> None:
 def _email(
     body: str = "this is the body of the email",
     attachments: list[AttachmentRecord] | None = None,
+    *,
+    subject: str = "hello",
+    summary: str | None = None,
 ) -> EmailRow:
     return EmailRow(
         id="msg-1",
-        subject="hello",
+        subject=subject,
         from_address="alice@example.com",
         from_name="Alice",
         to_addresses=[EmailAddress(address="bob@example.com")],
         received_at=int(time.time()),
         body_text=body,
         body_html=f"<p>{body}</p>",
+        summary=summary,
         attachments=attachments or [],
     )
 
 
 def test_empty_email_returns_no_chunks() -> None:
-    email = _email(body="")
+    # Empty subject + empty body → no embeddable content at all.
+    email = _email(body="", subject="")
     assert build_chunks_mod.build_chunks(email) == []
 
 
@@ -202,3 +207,66 @@ def test_header_skips_missing_fields() -> None:
     assert "From:" not in att_chunk.chunk_text
     # Filename header still present even when subject/from are empty
     assert "Attachment: report.pdf" in att_chunk.chunk_text
+
+
+def test_summary_is_emitted_as_summary_chunk() -> None:
+    """The LLM-generated summary now gets its own embedded chunk with
+    `source_type='summary'`. This is what lets semantic search treat
+    "matches the email's topical summary" as a first-class KNN hit
+    (and promote those matches above body/attachment-only matches)
+    instead of paying for a per-candidate rerank embedding at query time.
+    """
+    email = _email(
+        body="some body content",
+        subject="Q3 budget review",
+        summary="Q3 budget approved; deliverable due Aug 15.",
+    )
+    chunks = build_chunks_mod.build_chunks(email)
+    summary_chunks = [c for c in chunks if c.source_type == "summary"]
+    assert summary_chunks, "expected at least one summary chunk"
+    s = summary_chunks[0]
+    # Stable chunk-id format: no source_index in the slug because summary
+    # is a singleton per email.
+    assert s.chunk_id == "msg-1::summary::0"
+    assert s.source_name is None
+    # No header prepended — summary text is already self-contained.
+    assert s.chunk_text == "Q3 budget approved; deliverable due Aug 15."
+    assert "Subject:" not in s.chunk_text
+    assert "From:" not in s.chunk_text
+    assert len(s.embedding) == 384
+
+
+def test_no_summary_chunk_when_summary_absent() -> None:
+    """An email without a summary (LLM disabled / failed at ingest) must
+    not emit a summary chunk — empty/None summary is a no-op so we don't
+    burn a vector on whitespace."""
+    email = _email(body="body content", summary=None)
+    chunks = build_chunks_mod.build_chunks(email)
+    assert not any(c.source_type == "summary" for c in chunks)
+
+    email_empty = _email(body="body content", summary="   ")
+    chunks_empty = build_chunks_mod.build_chunks(email_empty)
+    assert not any(c.source_type == "summary" for c in chunks_empty)
+
+
+def test_build_summary_chunks_standalone() -> None:
+    """`build_summary_chunks` is the per-email helper used by
+    `set_email_summary` after the loader has already inserted body +
+    attachment chunks. It returns ONLY summary chunks, with the same
+    chunk-id format `build_chunks` uses for the summary slice."""
+    chunks = build_chunks_mod.build_summary_chunks(
+        "msg-1", "Q3 budget approved; deliverable due Aug 15."
+    )
+    assert len(chunks) >= 1
+    assert all(c.source_type == "summary" for c in chunks)
+    assert chunks[0].chunk_id == "msg-1::summary::0"
+    assert chunks[0].email_id == "msg-1"
+    assert chunks[0].source_name is None
+    assert len(chunks[0].embedding) == 384
+
+
+def test_build_summary_chunks_returns_empty_for_blank_input() -> None:
+    """None / empty / whitespace summary -> no chunks. Lets callers no-op."""
+    assert build_chunks_mod.build_summary_chunks("msg-1", None) == []
+    assert build_chunks_mod.build_summary_chunks("msg-1", "") == []
+    assert build_chunks_mod.build_summary_chunks("msg-1", "   ") == []

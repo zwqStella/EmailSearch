@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING
 
 from emailsearch.config import get_settings
@@ -59,6 +60,29 @@ def _get_embed_model() -> HuggingFaceEmbedding:
                     embed_batch_size=32,
                 )
     return _embed_model
+
+
+def preload_models() -> None:
+    """Eagerly initialize the splitter + embedding model.
+
+    Called from the web app's lifespan startup so the first user-facing
+    search doesn't pay the model-load latency. Safe to call multiple
+    times (the ``_get_*`` helpers are double-checked-locked singletons).
+    A warm-up embedding call is issued at the end so sentence-transformers'
+    lazy weight loading happens here, not on the first query.
+    """
+    t0 = time.monotonic()
+    _get_splitter()
+    model = _get_embed_model()
+    # First forward pass moves weights onto the chosen device; a throwaway
+    # query forces that to happen now.
+    try:
+        model.get_query_embedding("warmup")
+    except Exception:
+        # Don't let a warm-up failure poison startup — the next real call
+        # will surface the error through the normal code path.
+        log.exception("embedding warm-up call failed; continuing")
+    log.info("preloaded embedding stack in %.2fs", time.monotonic() - t0)
 
 
 def chunk_text(text: str) -> list[str]:

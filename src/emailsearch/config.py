@@ -34,6 +34,48 @@ class Settings(BaseSettings):
     ocr_enabled: bool = True
     max_attachment_mb: int = 25
 
+    # --- LLM summarization + query helpers ---
+    # Best-effort: every call gracefully no-ops to None on any failure, so
+    # search still works without a server. Set llm_enabled=False to skip the
+    # network round-trips entirely.
+    #
+    # LLM uses:
+    #   - ingest: `summarize_email` produces a per-email summary stored on
+    #     the row, indexed in FTS, and embedded as `source_type='summary'`
+    #     chunks so semantic search can match them via KNN.
+    #   - search: `distill_query` strips filler before FTS; `augment_query`
+    #     expands the query before embedding for the KNN leg.
+    #
+    # Defaults target the `copilot-api` proxy (OpenAI-compatible on :4141).
+    # `llm_model` must be a name the endpoint actually serves — strict
+    # backends (copilot-api, Azure OpenAI) reject unknown model names with
+    # HTTP 400; LM Studio / Ollama / llama.cpp usually ignore it.
+    llm_enabled: bool = True
+    llm_base_url: str = "http://127.0.0.1:4141/v1"
+    llm_model: str = "gpt-4o-mini"
+    # Generous default — proxied GPT-class models can take 10-30s under load.
+    llm_timeout_s: float = 60.0
+    llm_max_tokens: int = 200             # cap on summary length
+    llm_augment_max_tokens: int = 80      # cap on augmented-query length
+    llm_distill_max_tokens: int = 40      # cap on distilled-query length
+    llm_max_input_chars: int = 8000       # truncate body before summarizing
+
+    # --- Semantic ranking ---
+    # Per-chunk score floor for the embedding (KNN) leg. vec0 distances are
+    # converted via ``1 / (1 + distance)`` (range [0, 1]); chunks scoring
+    # below this are dropped before per-email grouping. Only the embedding
+    # leg is gated — verbatim FTS matches remain a strong signal even when
+    # the embedding similarity is incidental. Tune down for more recall, up
+    # for higher confidence.
+    semantic_score_threshold: float = 0.3
+
+    # --- Diagnostics ---
+    # When True, every /api/search response includes a `debug` field with
+    # the per-leg query-transformation + ranking trace (logged to the
+    # browser console). Cheap (capped previews, top-N entries) and very
+    # useful for diagnosing surprising results.
+    debug_enabled: bool = True
+
     # --- Server ---
     host: str = "127.0.0.1"
     port: int = 8765

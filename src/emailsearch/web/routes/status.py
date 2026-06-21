@@ -23,9 +23,9 @@ class OutlookStatus(BaseModel):
 def outlook_status() -> OutlookStatus:
     """Check whether we can talk to local Classic Outlook via COM.
 
-    Lightweight: opens a COM session, reads the user name from the namespace,
-    closes. **Does NOT walk folders** — folder enumeration only happens when
-    the user explicitly asks for it on the Load tab.
+    Lightweight: opens a COM session, reads the user name, closes. Does
+    NOT walk folders — folder enumeration only happens when the user
+    explicitly asks for it on the Load tab.
     """
     if sys.platform != "win32":
         return OutlookStatus(
@@ -39,7 +39,7 @@ def outlook_status() -> OutlookStatus:
 
     try:
         with OutlookClient() as client:
-            # Just touching the namespace's current user is enough to confirm COM
+            # Touching the namespace's current user is enough to confirm COM
             # is responsive — no folder walk, no message iteration.
             who = client.current_user_display() or "(unknown)"
         return OutlookStatus(available=True, detail=f"Connected as {who}.")
@@ -59,10 +59,9 @@ class SyncResponse(BaseModel):
 def outlook_sync() -> SyncResponse:
     """Trigger Outlook's Send/Receive on all accounts.
 
-    Asks Outlook to pull fresh items from the server within its current
-    Cached Exchange Mode window. **This will NOT retrieve items older than
-    the cache slider in Outlook's account settings** — to widen the cache,
-    the user must change the slider in Outlook itself.
+    Asks Outlook to pull fresh items within its Cached Exchange Mode
+    window. This will NOT retrieve items older than the cache slider —
+    the user must widen that in Outlook's account settings.
     """
     if sys.platform != "win32":
         return SyncResponse(ok=False, detail="Outlook COM is Windows-only.")

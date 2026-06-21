@@ -49,12 +49,12 @@ def extract_email(raw: RawMessage) -> EmailRow:
         body_html = ""
         ocr_used = False
 
-    # Fall back: empty body → use the source's preview.
+    # Empty body → use the source's preview.
     if not body_text:
         body_text = (raw.body_preview or "").strip()
 
-    # Ensure body_html is set whenever body_text has content. The frontend
-    # iframe renders body_html (sanitized), so missing markup = blank preview.
+    # body_html drives the iframe preview; synthesize one whenever
+    # body_text has content so the preview is never blank.
     if not body_html and body_text:
         body_html = f"<pre>{_escape_html(body_text)}</pre>"
 

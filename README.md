@@ -20,8 +20,12 @@ sentence-transformers; OCR runs locally with rapidocr-onnxruntime.
   and images (inline + attached) via OCR.
 - **Three search modes**: keyword (FTS5 + bm25), semantic (sqlite-vec KNN with
   `paraphrase-multilingual-MiniLM-L12-v2` embeddings, multilingual — English,
-  Chinese, 50+ languages), and hybrid (Reciprocal Rank Fusion). FTS5 uses the
-  `trigram` tokenizer so CJK substring queries work correctly.
+  Chinese, 50+ languages), and hybrid (runs every leg and merges client-side
+  by max score per email). FTS5 uses the `trigram` tokenizer so CJK substring
+  queries work correctly.
+- **Hard filters**: narrow any search by date range (presets), sender, or
+  folder. Filters apply BEFORE ranking — a folder filter excludes everything
+  outside that folder rather than just deprioritizing it.
 - **100% local**: no cloud services at all.
 
 ## Requirements
@@ -34,13 +38,19 @@ sentence-transformers; OCR runs locally with rapidocr-onnxruntime.
 ## Quick start
 
 ```powershell
-# 1. Install Python + Node deps
+# 1. Install Python + Node deps (first time only)
 uv sync
-cd frontend; npm install; npm run build; cd ..
+cd frontend; npm install; cd ..
 
-# 2. Run (no .env edits required — defaults are sensible)
-uv run emailsearch serve --open-browser
+# 2. Run — `start` rebuilds the frontend, stops any stale server on the
+#    port, then starts fresh and opens the browser. Re-run after any code
+#    change (Python or React) to pick it up.
+uv run emailsearch start
 # → http://127.0.0.1:8765
+
+# `serve` is the lower-level alternative: it just runs uvicorn (no rebuild,
+# no auto-stop). Use it for `--reload` or alongside the Vite dev server.
+uv run emailsearch serve --open-browser
 ```
 
 That's it. There's no sign-in step. Outlook auto-launches the first time we
@@ -97,10 +107,10 @@ src/emailsearch/
   extract/       PDF/DOCX/XLSX/text loaders + OCR + cid-image splicer
   embed/         LlamaIndex chunker + HF encoder + chunk-builder
   db/            schema.sql + connection + repositories
-  search/        keyword + semantic + hybrid (RRF)
+  search/        keyword + semantic_fts + semantic_knn legs (no fusion; merged client-side)
   sync/          in-memory job registry + idempotent loader
   web/           FastAPI app + routes (status/sync/search)
-  cli.py         `emailsearch serve|info`
+  cli.py         `emailsearch start|serve|info`
 
 frontend/
   src/api/       typed fetch wrappers
@@ -122,8 +132,63 @@ them up automatically on next start.
 | `EMAILSEARCH_EMBED_DIM`        | `384`                                                  | Must match the model's vector width.                   |
 | `EMAILSEARCH_OCR_ENABLED`      | `true`                                                 | Disable to skip image OCR (much faster).               |
 | `EMAILSEARCH_MAX_ATTACHMENT_MB`| `25`                                                   | Larger attachments are recorded as `skipped_too_large`. |
+| `EMAILSEARCH_LLM_ENABLED`      | `true`                                                 | LLM summarization + query rerank (see below). Set to `false` if you don't have a local model server running. |
+| `EMAILSEARCH_LLM_BASE_URL`     | `http://127.0.0.1:4141/v1`                             | OpenAI-compatible base URL. Default targets [copilot-api](https://github.com/ericc-ch/copilot-api). |
+| `EMAILSEARCH_LLM_MODEL`        | `gpt-4o-mini`                                          | Sent as the `model` field. Strict backends (copilot-api, Azure OpenAI) reject unknown names with 400; LM Studio / Ollama / llama.cpp usually ignore this and serve whatever's loaded. |
+| `EMAILSEARCH_LLM_TIMEOUT_S`    | `60`                                                   | Per-call timeout in seconds. Claude / GPT-class models can take 10-30s.    |
+| `EMAILSEARCH_LLM_MAX_TOKENS`   | `200`                                                  | Cap on summary length (model-side).                    |
+| `EMAILSEARCH_LLM_AUGMENT_MAX_TOKENS` | `80`                                             | Cap on query-augmentation length (model-side).         |
+| `EMAILSEARCH_LLM_DISTILL_MAX_TOKENS` | `40`                                             | Cap on query-distillation length (model-side).         |
+| `EMAILSEARCH_LLM_MAX_INPUT_CHARS` | `8000`                                              | Truncate body before prompting to bound cost / latency. |
+| `EMAILSEARCH_DEBUG_ENABLED`    | `true`                                                 | Include a per-request query-transformation trace in `/api/search` (logged to the browser console). |
 | `EMAILSEARCH_HOST`             | `127.0.0.1`                                            | **Don't change** unless you understand the implications. |
 | `EMAILSEARCH_PORT`             | `8765`                                                 | Server port.                                           |
+
+### LLM summarization + query helpers
+
+When `EMAILSEARCH_LLM_ENABLED=true` (the default), the LLM is used in **two
+places**, both best-effort (any failure falls back to the non-LLM path):
+
+1. **At ingest**: every new email is sent to a local OpenAI-compatible
+   `/v1/chat/completions` endpoint for a 1-3 sentence topical summary. The
+   summary is stored on the email row, shown above the body in the preview
+   pane and above the snippet in search results, appended to the FTS
+   `searchable_text` so keyword search picks up summary-only terms, AND
+   embedded as its own `source_type='summary'` vector so the semantic KNN
+   leg can match topical summaries directly.
+
+2. **At query time** (semantic + hybrid modes): the user's query is
+   **distilled** to strip natural-language filler ("help me find the email
+   about Q3 budget" → "Q3 budget") before the FTS leg, and **augmented**
+   with related vocabulary before the embedding step. Emails whose summary
+   chunk matched are promoted above body-only matches inside the KNN leg
+   (see `search.service.SUMMARY_PROMOTION_BASE`).
+
+Compatible local servers include LM Studio, llama.cpp's `llama-server`,
+llamafile, Ollama (with the `/v1` shim enabled), and vLLM. Point
+`EMAILSEARCH_LLM_BASE_URL` at whatever your server exposes.
+
+Set `EMAILSEARCH_LLM_ENABLED=false` if you don't have a local model server —
+all LLM features will be skipped and search falls back to embedding + bm25
+ranking without distillation / augmentation. There's also a live integration
+test suite at `tests/test_llm_integration.py` that probes the configured
+endpoint and exercises every job kind (summarize / distill / augment); it
+skips silently when no server is reachable.
+
+Existing emails that were loaded **before** you enabled this flag won't have
+summaries — run `scripts/backfill_summaries.py` to fill them in without
+re-loading from Outlook, or clear the index and re-load.
+
+### Diagnostics
+
+Every `/api/search/stream` event carries a per-leg `trace` field with the
+full query-transformation + ranking detail (raw query → distilled → FTS
+MATCH expression → vec0 top chunks → final ranking). The frontend logs it
+to the browser console (collapsed group) on every search so you can
+diagnose surprising results without re-issuing the query. The server also
+emits `log.info` lines at each step in the same trace, visible in the
+uvicorn output. Set `EMAILSEARCH_DEBUG_ENABLED=false` to drop the wire-side
+payload (server logs stay on).
 
 ## Troubleshooting
 

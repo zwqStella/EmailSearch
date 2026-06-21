@@ -44,6 +44,20 @@ def apply_schema(conn: sqlite3.Connection) -> None:
     """Apply schema.sql idempotently (CREATE IF NOT EXISTS throughout)."""
     sql = resources.files("emailsearch.db").joinpath("schema.sql").read_text(encoding="utf-8")
     conn.executescript(sql)
+    _migrate_legacy_columns(conn)
+
+
+def _migrate_legacy_columns(conn: sqlite3.Connection) -> None:
+    """Add columns present in the latest schema but missing from older DBs.
+
+    ``CREATE TABLE IF NOT EXISTS`` is a no-op when the table already exists,
+    so new columns added to schema.sql don't reach pre-existing databases.
+    We backfill them here with ``ALTER TABLE ... ADD COLUMN`` so users don't
+    have to clear-and-resync just to pick up a new column.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(emails)")}
+    if "summary" not in cols:
+        conn.execute("ALTER TABLE emails ADD COLUMN summary TEXT")
 
 
 @contextmanager

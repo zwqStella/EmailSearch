@@ -8,7 +8,9 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 ExtractionStatus = Literal["ok", "skipped_too_large", "unsupported", "failed", "empty"]
-SourceType = Literal["body", "attachment"]
+# 'summary' chunks hold the LLM-generated topical summary, embedded at
+# ingest so semantic search can match them via KNN in a single pass.
+SourceType = Literal["body", "attachment", "summary"]
 
 
 class EmailAddress(BaseModel):
@@ -48,6 +50,7 @@ class EmailRow(BaseModel):
     body_text: str = ""
     body_html: str = ""
     web_link: str | None = None
+    summary: str | None = None  # LLM-generated; None when llm_enabled=False or generation failed
     attachments: list[AttachmentRecord] = Field(default_factory=list)
     has_attachments: bool = False
     body_ocr_used: bool = False
@@ -55,6 +58,10 @@ class EmailRow(BaseModel):
     @property
     def searchable_text(self) -> str:
         parts = [self.body_text]
+        # Summary is short but high-signal — including it in the FTS input
+        # lets a keyword the LLM lifted out of a long body still match.
+        if self.summary:
+            parts.append(self.summary)
         for a in self.attachments:
             if a.extracted_text:
                 parts.append(a.extracted_text)

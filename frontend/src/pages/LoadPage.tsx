@@ -44,14 +44,13 @@ export default function LoadPage() {
   const folders = useQuery({
     queryKey: ['folders'],
     queryFn: listFolders,
-    // Don't probe Outlook on page mount — folder walks can take a while on
-    // big mailboxes. The user clicks "Load folder list" to trigger it.
+    // Don't probe Outlook on page mount — folder walks can take a while
+    // on big mailboxes. The user clicks "Load folder list" to trigger it.
     enabled: false,
     staleTime: 5 * 60_000,
   });
-  // The server's job list is the source of truth. We poll it on a short
-  // interval whenever ANY job is running, so the "Active job" card survives
-  // navigation away and back — local state alone was lost on unmount.
+  // Poll the server-backed job list whenever any job is running so the
+  // "Active job" card survives navigation away and back.
   const jobs = useQuery({
     queryKey: ['jobs'],
     queryFn: listJobs,
@@ -64,9 +63,9 @@ export default function LoadPage() {
     },
   });
 
-  // Discover the running job from the server-backed list, falling back to
-  // the locally-stashed id if the user just started something but the next
-  // jobs poll hasn't landed yet.
+  // Discover the running job from the server-backed list, falling back
+  // to the locally-stashed id if the user just started something but
+  // the next jobs poll hasn't landed yet.
   const runningFromList = (jobs.data?.jobs ?? []).find(
     (j) => j.status === 'running' || j.status === 'pending',
   );

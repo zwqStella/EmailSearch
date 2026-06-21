@@ -26,9 +26,8 @@ function statusColor(s: AttachmentRecord['status']): string {
 }
 
 export default function EmailPreview({ email }: { email: EmailRow }) {
-  // The backend guarantees body_html is set whenever body_text has content
-  // (see extract/pipeline.py). DOMPurify strips any active content before we
-  // hand it to the sandboxed iframe.
+  // body_html is guaranteed set whenever body_text has content (see
+  // extract/pipeline.py). DOMPurify strips any active content.
   const sanitized = useMemo(() => DOMPurify.sanitize(email.body_html), [email.body_html]);
 
   return (
@@ -56,6 +55,14 @@ export default function EmailPreview({ email }: { email: EmailRow }) {
         {email.to_addresses.length > 0 && (
           <div className="text-xs text-gray-600 mt-1">
             To: {email.to_addresses.map((a) => a.address).join(', ')}
+          </div>
+        )}
+        {email.summary && (
+          // LLM-generated topical summary card. Plain text — no markup
+          // to sanitize.
+          <div className="mt-3 p-2 rounded bg-blue-50 border border-blue-100 text-xs text-blue-900">
+            <span className="font-semibold mr-1">Summary:</span>
+            {email.summary}
           </div>
         )}
       </div>
