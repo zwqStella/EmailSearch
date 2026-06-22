@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sqlite3
 import time
 from collections.abc import AsyncIterator
 from typing import Literal
@@ -27,7 +26,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from emailsearch.config import get_settings
-from emailsearch.db.connection import connect, open_connection
+from emailsearch.db.connection import connect, pooled_connection
 from emailsearch.db.repositories import (
     count_chunks,
     count_emails,
@@ -56,17 +55,18 @@ async def _run_leg_in_thread(
     filters: SearchFilters,
     debug: bool,
 ) -> LegResult:
-    """Run a single leg on a worker thread with its own SQLite connection.
+    """Run a single leg on a worker thread with a pooled SQLite connection.
 
     A dedicated connection per leg gives true parallelism out of SQLite
     + WAL for read-only queries. The embedding leg's slow LLM hop holds
     no DB lock so FTS legs return in milliseconds even when augmentation
-    takes a couple of seconds.
+    takes a couple of seconds. The pool reuses the warmed-up sqlite-vec
+    handle across requests so we don't pay the extension-load + pragma
+    cost on every search.
     """
 
     def _work() -> LegResult:
-        conn: sqlite3.Connection = open_connection(db_path)
-        try:
+        with pooled_connection(db_path) as conn:
             return run_leg(
                 source,  # type: ignore[arg-type]
                 conn,
@@ -75,8 +75,6 @@ async def _run_leg_in_thread(
                 filters=filters,
                 debug=debug,
             )
-        finally:
-            conn.close()
 
     return await asyncio.to_thread(_work)
 

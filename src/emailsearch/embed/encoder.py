@@ -102,6 +102,43 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     return _get_embed_model().get_text_embedding_batch(texts)
 
 
+# Pure function of (text, model name) — same input always yields the same
+# vector. Repeat searches (debounced typing, query refinement, back-button
+# navigation) hit the same string over and over, so caching saves 10-50 ms
+# of CPU per call on the hot path. Bounded so a long-running server with
+# wild query variety doesn't grow memory unbounded; cached lists are tiny
+# (384 floats ≈ 3 KB) so 1024 entries ≈ 3 MB.
+_EMBED_QUERY_CACHE_MAX = 1024
+_embed_query_cache: dict[tuple[str, str], list[float]] = {}
+_embed_cache_lock = threading.Lock()
+
+
+def clear_embed_query_cache() -> None:
+    """Drop every cached query embedding. Used by tests."""
+    with _embed_cache_lock:
+        _embed_query_cache.clear()
+
+
 def embed_query(text: str) -> list[float]:
-    """Embed a search query (HF embeddings use the same encoding for query/text)."""
-    return _get_embed_model().get_query_embedding(text)
+    """Embed a search query (HF embeddings use the same encoding for query/text).
+
+    Cached per (text, model name) so debounced re-searches don't re-run the
+    encoder. Returns the cached list directly — callers must NOT mutate it.
+    """
+    settings = get_settings()
+    key = (text, settings.embed_model)
+    with _embed_cache_lock:
+        cached = _embed_query_cache.get(key)
+    if cached is not None:
+        return cached
+
+    vector = _get_embed_model().get_query_embedding(text)
+    with _embed_cache_lock:
+        # FIFO eviction — dict preserves insertion order in CPython.
+        if (
+            len(_embed_query_cache) >= _EMBED_QUERY_CACHE_MAX
+            and key not in _embed_query_cache
+        ):
+            _embed_query_cache.pop(next(iter(_embed_query_cache)))
+        _embed_query_cache[key] = vector
+    return vector

@@ -43,10 +43,13 @@ class Settings(BaseSettings):
     # :4141). `llm_model` must be a name the endpoint serves — strict
     # backends (copilot-api, Azure OpenAI) reject unknown model names
     # with HTTP 400; LM Studio / Ollama / llama.cpp usually ignore it.
+    # copilot-api transparently translates the OpenAI chat-completions
+    # payload to Anthropic / Gemini for non-OpenAI model ids, so any id
+    # from ``GET /v1/models`` is fair game.
     llm_enabled: bool = True
     llm_base_url: str = "http://127.0.0.1:4141/v1"
-    llm_model: str = "gpt-4o-mini"
-    # Generous default — proxied GPT-class models can take 10-30s under load.
+    llm_model: str = "claude-haiku-4.5"
+    # Generous default — proxied LLM calls can take 10-30s under load.
     llm_timeout_s: float = 60.0
     llm_max_tokens: int = 200             # cap on summary length
     llm_augment_max_tokens: int = 80      # cap on augmented-query length
@@ -72,8 +75,10 @@ class Settings(BaseSettings):
     # Token budget for the synthesis prompt's sources block (all
     # selected emails combined). CJK-aware estimator + max-min
     # fair-share allocation: short emails get their full content, long
-    # ones share what's left. 8000 tokens leaves comfortable headroom
-    # under a 12K-token model (the strictest tier on common proxies).
+    # ones share what's left. 8000 tokens is a latency/cost cap, not a
+    # capability limit — Claude Haiku / GPT-4.1 / Gemini Flash all have
+    # 100K+ context windows. Raise it if Ask answers feel under-grounded
+    # (and you're OK paying for the extra input tokens).
     ask_max_prompt_tokens: int = 8000
     # Max emails to read FULLY after triage. Keeping this small (3) is
     # what gets the synthesis prompt from ~24K tokens down to ~5-10K.

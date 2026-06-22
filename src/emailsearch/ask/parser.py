@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from datetime import date
 
 from pydantic import BaseModel
@@ -30,6 +31,24 @@ from emailsearch.config import get_settings
 from emailsearch.summarize.client import _call_chat
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Result cache. Pure function of (question, model, today_iso) — today_iso is
+# baked into the prompt for relative-time resolution, so the cache key must
+# include it so a cached "yesterday" question is not reused after midnight.
+# Only successful parses are cached so a transient LLM failure doesn't lock
+# in a fallback ParsedAskRequest(query=question) for the rest of the process.
+# ---------------------------------------------------------------------------
+
+_PARSE_CACHE_MAX = 256
+_parse_cache: dict[tuple[str, str, str], ParsedAskRequest] = {}
+_cache_lock = threading.Lock()
+
+
+def clear_parse_cache() -> None:
+    """Drop every cached parse result. Used by tests."""
+    with _cache_lock:
+        _parse_cache.clear()
 
 # Conservative email-shape filter — we only want to populate
 # SearchFilters.from_address when we're sure the string looks like an
@@ -166,6 +185,10 @@ def parse_ask_question(question: str) -> ParsedAskRequest:
     ("this month", "yesterday") resolve against the same clock that
     produced the indexed ``received_at`` epochs. Per-user timezones are
     out of scope.
+
+    Successful parses are cached per (question, model, today_iso) so
+    re-asking the same question is free. The date component of the key
+    keeps relative-time questions correct across day boundaries.
     """
     question = (question or "").strip()
     if not question:
@@ -178,6 +201,13 @@ def parse_ask_question(question: str) -> ParsedAskRequest:
         return fallback
 
     today_iso = date.today().isoformat()
+    cache_key = (question, settings.llm_model, today_iso)
+    with _cache_lock:
+        cached = _parse_cache.get(cache_key)
+    if cached is not None:
+        log.info("ask parse: cache hit for question=%r", question[:60])
+        return cached
+
     prompt = _ASK_PARSE_PROMPT.format(today_iso=today_iso, question=question)
     response = _call_chat(
         prompt=prompt,
@@ -192,6 +222,10 @@ def parse_ask_question(question: str) -> ParsedAskRequest:
         "ask parse: question=%r → query=%r start_at=%s end_at=%s from=%r",
         question, parsed.query, parsed.start_at, parsed.end_at, parsed.from_address,
     )
+    with _cache_lock:
+        if len(_parse_cache) >= _PARSE_CACHE_MAX and cache_key not in _parse_cache:
+            _parse_cache.pop(next(iter(_parse_cache)))
+        _parse_cache[cache_key] = parsed
     return parsed
 
 

@@ -15,12 +15,60 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
 
 from emailsearch.config import get_settings
 from emailsearch.db.models import EmailRow
+
+# ---------------------------------------------------------------------------
+# Result caches for the query-time LLM hops.
+#
+# distill_query / augment_query are pure functions of (query string, model id):
+# the same input always produces the same output for a given model. Caching
+# saves a 10-30s LLM round-trip on every repeat search — which is the
+# dominant latency the user feels while iterating on a query.
+#
+# Keyed on (query, model) so swapping ``EMAILSEARCH_LLM_MODEL`` produces fresh
+# results, and so tests that monkeypatch the model id stay isolated.
+# Bounded sizes prevent unbounded memory growth on a long-running server.
+# Only SUCCESSFUL (non-None) results are stored — a network blip should not
+# turn into a sticky None for the rest of the process lifetime.
+# ---------------------------------------------------------------------------
+
+_QUERY_CACHE_MAX = 512
+_distill_cache: dict[tuple[str, str], str] = {}
+_augment_cache: dict[tuple[str, str], str] = {}
+_cache_lock = threading.Lock()
+
+
+def _cache_get(
+    cache: dict[tuple[str, str], str], key: tuple[str, str]
+) -> str | None:
+    with _cache_lock:
+        return cache.get(key)
+
+
+def _cache_put(
+    cache: dict[tuple[str, str], str], key: tuple[str, str], value: str
+) -> None:
+    with _cache_lock:
+        # Naive FIFO eviction — ``dict`` preserves insertion order in
+        # CPython, so popping the first key drops the oldest entry. Good
+        # enough for a process-lifetime cache; no need for an LRU promotion
+        # path on the read side.
+        if len(cache) >= _QUERY_CACHE_MAX and key not in cache:
+            cache.pop(next(iter(cache)))
+        cache[key] = value
+
+
+def clear_query_caches() -> None:
+    """Drop every cached distill/augment result. Used by tests."""
+    with _cache_lock:
+        _distill_cache.clear()
+        _augment_cache.clear()
 
 log = logging.getLogger(__name__)
 
@@ -235,6 +283,11 @@ def augment_query(query: str) -> str | None:
     Used by the semantic_knn leg before embedding. Bridges the gap
     between a terse user query ("budget update") and richer indexed
     text. Caller falls back to embedding the raw query on None.
+
+    Results are cached per (query, model) so repeat searches don't pay the
+    LLM round-trip a second time. The cache is process-local; failures
+    (None) are intentionally not cached so transient network errors don't
+    poison subsequent attempts.
     """
     settings = get_settings()
     if not settings.llm_enabled:
@@ -244,12 +297,21 @@ def augment_query(query: str) -> str | None:
     if not query:
         return None
 
+    key = (query, settings.llm_model)
+    cached = _cache_get(_augment_cache, key)
+    if cached is not None:
+        log.info("augment: cache hit for query=%r", query[:60])
+        return cached
+
     prompt = _AUGMENT_PROMPT.format(query=query)
-    return _call_chat(
+    result = _call_chat(
         prompt=prompt,
         max_tokens=settings.llm_augment_max_tokens,
         log_label=f"augment({query[:40]!r})",
     )
+    if result is not None:
+        _cache_put(_augment_cache, key, result)
+    return result
 
 
 def distill_query(query: str) -> str | None:
@@ -258,6 +320,9 @@ def distill_query(query: str) -> str | None:
     Used by the semantic_fts leg. Strips filler ("help me find...") to a
     content-only phrase ("Q3 budget approval"). Caller falls back to the
     raw query on None.
+
+    Results are cached per (query, model) — see :func:`augment_query` for
+    cache semantics.
     """
     settings = get_settings()
     if not settings.llm_enabled:
@@ -267,12 +332,21 @@ def distill_query(query: str) -> str | None:
     if not query:
         return None
 
+    key = (query, settings.llm_model)
+    cached = _cache_get(_distill_cache, key)
+    if cached is not None:
+        log.info("distill: cache hit for query=%r", query[:60])
+        return cached
+
     prompt = _DISTILL_PROMPT.format(query=query)
-    return _call_chat(
+    result = _call_chat(
         prompt=prompt,
         max_tokens=settings.llm_distill_max_tokens,
         log_label=f"distill({query[:40]!r})",
     )
+    if result is not None:
+        _cache_put(_distill_cache, key, result)
+    return result
 
 
 def _call_chat(*, prompt: str, max_tokens: int, log_label: str) -> str | None:
