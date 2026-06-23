@@ -223,6 +223,18 @@ __marimo__/
 *.db-shm
 *.db-wal
 
+# Eval harness — patterns and outputs are derived from the local DB
+# and may reference internal subjects / Message-IDs / sender names.
+# Keep these out of the shared repo; ship only specs.example.toml as
+# a template. Regenerate locally:
+#   cp eval/specs.example.toml eval/specs.toml   # first time only
+#   uv run python scripts/materialize_queries.py
+#   uv run python -m emailsearch.eval run
+eval/specs.toml
+eval/queries.toml
+eval/report.md
+eval/report.json
+
 # Bundled frontend output served by FastAPI in prod
 src/emailsearch/web/static/
 

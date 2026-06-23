@@ -1,0 +1,123 @@
+# Example evaluation specs for the EmailSearch quality harness.
+#
+# Copy this to eval/specs.toml and edit the patterns to point at your
+# own mailbox content. eval/specs.toml is gitignored so your real
+# patterns won't be committed.
+#
+# Each [[specs]] entry defines:
+#   id           — unique identifier (string)
+#   text         — the query string a user would type
+#   category     — one of: verbatim, topic, semantic, multilingual,
+#                  person, attachment, thread
+#   description  — free-form notes (shown in the report)
+#   where_sql    — fragment appended to
+#                  "SELECT id FROM emails WHERE 1=1 ..."
+#                  Use SUBJECT/FROM_ADDRESS predicates to pick a
+#                  *distinctive cluster* — broad patterns over a huge
+#                  category make the metrics meaningless (the system
+#                  finds correct emails, just not the specific ones
+#                  you happened to pick).
+#   cap          — max IDs to keep (default: 8). Use a small cap for
+#                  narrow clusters, larger for thread tests.
+#   order_by     — SQL ORDER BY clause (default: "received_at DESC").
+#
+# Authoring rules of thumb:
+#   - Pair each query with a pattern that picks a NARROW slice. If the
+#     pattern matches thousands of rows, your query needs an extra
+#     distinctive token (e.g. project name, region, sender domain).
+#   - For semantic queries, write text that AVOIDS the verbatim tokens
+#     used by where_sql. That's how you measure whether the embedding
+#     leg can paraphrase.
+#   - For multilingual queries, write text in one language and target
+#     the matching bilingual subject pattern with where_sql.
+#   - For attachment / person / thread categories, the where_sql should
+#     pick a stable, distinctive subject prefix so the query and ground
+#     truth align by construction.
+
+# --- VERBATIM: exact tokens that should land via FTS keyword leg ---
+
+[[specs]]
+id = "q01_security_pr"
+text = "security PR ignore-scripts npmrc"
+category = "verbatim"
+description = "Example: automated security PRs touching .npmrc."
+where_sql = "AND subject LIKE '%[SECURITY]%' AND subject LIKE '%npmrc%'"
+cap = 6
+
+[[specs]]
+id = "q02_weekly_newsletter"
+text = "weekly product release newsletter"
+category = "verbatim"
+description = "Example: recurring weekly release newsletter, distinct dates."
+where_sql = "AND subject LIKE '%Weekly Newsletter%'"
+cap = 6
+
+# --- TOPIC: paraphrased but stays in domain vocabulary ---
+
+[[specs]]
+id = "q03_holiday_message"
+text = "company holiday message"
+category = "topic"
+description = "Example: a holiday-observance message — single narrow match."
+where_sql = "AND subject LIKE '%Juneteenth%'"
+cap = 3
+
+# --- SEMANTIC: requires the embedding leg to generalize ---
+
+[[specs]]
+id = "q04_paraphrase_security_pr"
+text = "automated change to package installation safety settings"
+category = "semantic"
+description = """\
+Example: paraphrase of the security PR thread — query avoids the \
+verbatim 'npmrc' / 'ignore-scripts' tokens to force the semantic leg \
+to do real work.\
+"""
+where_sql = "AND subject LIKE '%[SECURITY]%' AND subject LIKE '%npmrc%'"
+cap = 6
+
+# --- MULTILINGUAL: CJK / bilingual subjects ---
+
+[[specs]]
+id = "q05_cjk_cafeteria"
+text = "园区 餐厅"
+category = "multilingual"
+description = "Example: CJK query for campus dining announcements."
+where_sql = "AND (subject LIKE '%餐厅%' OR subject LIKE '%cafeteria%')"
+cap = 5
+
+[[specs]]
+id = "q06_bilingual_event"
+text = "fitness activity"
+category = "multilingual"
+description = "Example: English query against a bilingual subject."
+where_sql = "AND (subject LIKE '%健身%' OR subject LIKE '%fitness%')"
+cap = 5
+
+# --- ATTACHMENT: answer lives in an attached file ---
+
+[[specs]]
+id = "q07_product_update_attachment"
+text = "product update newsletter with attachment"
+category = "attachment"
+description = "Example: newsletter that includes a PDF attachment."
+where_sql = "AND subject LIKE 'VS Code Insiders Update%' AND has_attachments = 1"
+cap = 5
+
+# --- PERSON / THREAD: distinctive recurring or single-conversation patterns ---
+
+[[specs]]
+id = "q08_recurring_report"
+text = "performance test report"
+category = "person"
+description = "Example: recurring perf-test report series with attachments."
+where_sql = "AND subject LIKE '%Perf Test%' AND has_attachments = 1"
+cap = 8
+
+[[specs]]
+id = "q09_welcome_thread"
+text = "welcome new team member"
+category = "thread"
+description = "Example: a single welcome-thread, replies all share a subject prefix."
+where_sql = "AND subject LIKE 'Re: %Welcome to the%' OR subject LIKE 'RE: %Welcome to the%'"
+cap = 8

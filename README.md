@@ -110,6 +110,7 @@ src/emailsearch/
   search/        keyword + semantic_fts + semantic_knn legs (no fusion; merged client-side)
   sync/          in-memory job registry + idempotent loader
   web/           FastAPI app + routes (status/sync/search)
+  eval/          IR-style quality harness (P@K, R@K, MRR, nDCG@K, latency)
   cli.py         `emailsearch start|serve|info`
 
 frontend/
@@ -117,6 +118,41 @@ frontend/
   src/pages/     SearchPage, LoadPage, SettingsPage
   src/components/EmailPreview.tsx (sandboxed iframe + attachment cards)
 ```
+
+### Search-quality evaluation
+
+A small IR-style harness lives under `src/emailsearch/eval/`. It runs a
+curated set of queries through `search()` in every mode and reports
+Precision@5/10/20, Recall@5/10/20, MRR, nDCG@10, and p50/p95 latency,
+plus a per-category breakdown (verbatim / topic / semantic /
+multilingual / person / thread / attachment) and a per-query
+rank-of-first-relevant-hit table.
+
+Queries and ground-truth labels live in **`eval/specs.toml`** — a local
+TOML file that's gitignored so your real subject patterns don't get
+published. The committed `eval/specs.example.toml` is a template.
+
+```powershell
+# 1. Bootstrap your local specs from the example (first time only)
+Copy-Item eval/specs.example.toml eval/specs.toml
+#    then edit eval/specs.toml to point at your own mailbox patterns.
+
+# 2. Materialize ground-truth IDs from those patterns
+uv run python scripts/materialize_queries.py
+#    → writes eval/queries.toml with the resolved Message-IDs.
+
+# 3. Sanity-check that every relevance ID resolves in the DB
+uv run python -m emailsearch.eval validate
+
+# 4. Run all queries through every mode and write a markdown report
+uv run python -m emailsearch.eval run --json-out eval/report.json
+#    → writes eval/report.md + eval/report.json.
+```
+
+Why config-driven? The relevance labels need to be picked by *subject
+or sender pattern* — not by what the search system returns — so the
+metrics stay unbiased. Patterns reference real mailbox content, so we
+keep them in a local file rather than baked into the script.
 
 ## Configuration (`.env`)
 
